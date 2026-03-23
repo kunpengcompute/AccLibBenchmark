@@ -33,7 +33,8 @@
 #include "bthread/bthread.h"
 #include "bvar/latency_recorder.h"
 #include "bvar/variable.h"
-#include "test.pb.h"
+#include <fstream>
+#include "press.pb.h"
 
 #ifdef BRPC_WITH_RDMA
 
@@ -55,6 +56,21 @@ DEFINE_string(request_compress_type, "none",
               "Compression algorithm for request protobuf body: none/snappy/gzip/zlib");
 DEFINE_string(payload_mode, "message",
               "Where benchmark payload is carried: message or attachment");
+
+DEFINE_string(data_file, "./request_data.pb", "Path to the pre-generated pb data");
+std::vector<press_test::Request> g_pregenerated_requests;
+butil::atomic<size_t> g_request_idx(0);
+
+int LoadTestData() {
+    std::ifstream input(FLAGS_data_file, std::ios::binary);
+    if (!input) { LOG(ERROR) << "No data file"; return -1; }
+    press_test::Requests collection;
+    if (!collection.ParseFromIstream(&input)) return -1;
+    for (int i = 0; i < collection.requests_size(); ++i) {
+        g_pregenerated_requests.push_back(collection.requests(i));
+    }
+    return g_pregenerated_requests.empty() ? -1 : 0;
+}
 
 bvar::LatencyRecorder g_latency_recorder("client");
 bvar::LatencyRecorder g_server_cpu_recorder("server_cpu");
@@ -193,8 +209,8 @@ public:
             return -1;
         }
         brpc::Controller cntl;
-        test::PerfTestResponse response;
-        test::PerfTestRequest request;
+        press_test::PerfTestResponse response;
+        press_test::Request request;
         cntl.set_request_compress_type(g_request_compress_type);
         request.set_echo_attachment(_echo_attachment);
         if (g_payload_mode == PAYLOAD_MODE_MESSAGE) {
@@ -202,7 +218,7 @@ public:
         } else {
             cntl.request_attachment().append(_attachment);
         }
-        test::PerfTestService_Stub stub(_channel);
+        press_test::PerfTestService_Stub stub(_channel);
         stub.Test(&cntl, &request, &response, NULL);
         if (cntl.Failed()) {
             LOG(ERROR) << "RPC call failed: " << cntl.ErrorText();
@@ -213,7 +229,7 @@ public:
 
     struct RespClosure {
         brpc::Controller* cntl;
-        test::PerfTestResponse* resp;
+        press_test::PerfTestResponse* resp;
         PerformanceTest* test;
     };
 
@@ -225,10 +241,13 @@ public:
             g_token.fetch_sub(1, butil::memory_order_relaxed);
         }
         RespClosure* closure = new RespClosure;
-        test::PerfTestRequest request;
-        closure->resp = new test::PerfTestResponse();
+        closure->resp = new press_test::PerfTestResponse();
         closure->cntl = new brpc::Controller();
         closure->cntl->set_request_compress_type(g_request_compress_type);
+
+        size_t idx = g_request_idx.fetch_add(1, butil::memory_order_relaxed) % g_pregenerated_requests.size();
+        press_test::Request request = g_pregenerated_requests[idx]; // 拷贝一份以便修改
+        
         request.set_echo_attachment(_echo_attachment);
         if (g_payload_mode == PAYLOAD_MODE_MESSAGE) {
             request.set_payload(_payload);
@@ -237,13 +256,13 @@ public:
         }
         closure->test = this;
         google::protobuf::Closure* done = brpc::NewCallback(&HandleResponse, closure);
-        test::PerfTestService_Stub stub(_channel);
+        press_test::PerfTestService_Stub stub(_channel);
         stub.Test(closure->cntl, &request, closure->resp, done);
     }
 
     static void HandleResponse(RespClosure* closure) {
         std::unique_ptr<brpc::Controller> cntl_guard(closure->cntl);
-        std::unique_ptr<test::PerfTestResponse> response_guard(closure->resp);
+        std::unique_ptr<press_test::PerfTestResponse> response_guard(closure->resp);
         if (closure->cntl->Failed()) {
             LOG(ERROR) << "RPC call failed: " << closure->cntl->ErrorText();
             closure->test->_stop = true;
@@ -403,6 +422,7 @@ void Test(int thread_num, int attachment_size) {
 }
 
 int main(int argc, char* argv[]) {
+    if (LoadTestData() != 0) return -1;
     GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     brpc::GlobalInitializeOrDie();
 

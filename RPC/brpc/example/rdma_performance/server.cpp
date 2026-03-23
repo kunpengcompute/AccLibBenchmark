@@ -27,7 +27,7 @@
 #include "brpc/global.h"
 #include "brpc/server.h"
 #include "bvar/variable.h"
-#include "test.pb.h"
+#include "press.pb.h"
 
 #ifdef BRPC_WITH_RDMA
 
@@ -85,14 +85,14 @@ bool ParseCompressionType(const std::string& name,
     return true;
 }
 
-namespace test {
+namespace press_test {
 class PerfTestServiceImpl : public PerfTestService {
 public:
     PerfTestServiceImpl() {}
     ~PerfTestServiceImpl() {}
 
     void Test(google::protobuf::RpcController* cntl_base,
-              const PerfTestRequest* request,
+              const Request* request,
               PerfTestResponse* response,
               google::protobuf::Closure* done) {
         brpc::ClosureGuard done_guard(done);
@@ -142,7 +142,7 @@ int main(int argc, char* argv[]) {
     }
 
     brpc::Server server;
-    test::PerfTestServiceImpl perf_test_service_impl;
+    press_test::PerfTestServiceImpl perf_test_service_impl;
 
     if (server.AddService(&perf_test_service_impl, 
                           brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
