@@ -36,8 +36,6 @@
 #include <fstream>
 #include "press.pb.h"
 
-#ifdef BRPC_WITH_RDMA
-
 DEFINE_int32(thread_num, 0, "How many threads are used");
 DEFINE_int32(queue_depth, 1, "How many requests can be pending in the queue");
 DEFINE_int32(expected_qps, 0, "The expected QPS");
@@ -479,12 +477,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-
-#else
-
-int main(int argc, char* argv[]) {
-    LOG(ERROR) << " brpc is not compiled with rdma. To enable it, please refer to https://github.com/apache/brpc/blob/master/docs/en/rdma.md";
-    return 0;
-}
-
-#endif

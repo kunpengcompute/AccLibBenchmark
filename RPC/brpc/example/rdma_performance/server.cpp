@@ -29,8 +29,6 @@
 #include "bvar/variable.h"
 #include "press.pb.h"
 
-#ifdef BRPC_WITH_RDMA
-
 DEFINE_int32(port, 8002, "TCP Port of this server");
 DEFINE_bool(use_rdma, true, "Use RDMA or not");
 DEFINE_string(response_compress_type, "none",
@@ -161,13 +159,3 @@ int main(int argc, char* argv[]) {
     server.RunUntilAskedToQuit();
     return 0;
 }
-
-#else
-
-
-int main(int argc, char* argv[]) {
-    LOG(ERROR) << " brpc is not compiled with rdma. To enable it, please refer to https://github.com/apache/brpc/blob/master/docs/en/rdma.md";
-    return 0;
-}
-
-#endif
