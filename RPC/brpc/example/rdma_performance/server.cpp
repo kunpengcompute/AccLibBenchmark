@@ -26,6 +26,7 @@
 #include "brpc/compress.h"
 #include "brpc/global.h"
 #include "brpc/server.h"
+#include "brpc/rpc_pb_message_factory.h"
 #include "bvar/variable.h"
 #include "press.pb.h"
 
@@ -33,6 +34,7 @@ DEFINE_int32(port, 8002, "TCP Port of this server");
 DEFINE_bool(use_rdma, true, "Use RDMA or not");
 DEFINE_string(response_compress_type, "none",
               "Compression algorithm for response protobuf body: none/snappy/gzip/zlib");
+DEFINE_int32(num_threads, 8, "Number of threads for server");
 
 butil::atomic<uint64_t> g_last_time(0);
 brpc::CompressType g_response_compress_type = brpc::COMPRESS_TYPE_NONE;
@@ -151,6 +153,8 @@ int main(int argc, char* argv[]) {
 
     brpc::ServerOptions options;
     options.use_rdma = FLAGS_use_rdma;
+    options.num_threads = FLAGS_num_threads;
+    options.rpc_pb_message_factory = brpc::GetArenaRpcPBMessageFactory();
     if (server.Start(FLAGS_port, &options) != 0) {
         LOG(ERROR) << "Fail to start EchoServer";
         return -1;
