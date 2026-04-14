@@ -36,8 +36,6 @@
 #include <fstream>
 #include "press.pb.h"
 
-#ifdef BRPC_WITH_RDMA
-
 DEFINE_int32(thread_num, 0, "How many threads are used");
 DEFINE_int32(queue_depth, 1, "How many requests can be pending in the queue");
 DEFINE_int32(expected_qps, 0, "The expected QPS");
@@ -56,21 +54,7 @@ DEFINE_string(request_compress_type, "none",
               "Compression algorithm for request protobuf body: none/snappy/gzip/zlib");
 DEFINE_string(payload_mode, "message",
               "Where benchmark payload is carried: message or attachment");
-
 DEFINE_string(data_file, "./request_data.pb", "Path to the pre-generated pb data");
-std::vector<press_test::Request> g_pregenerated_requests;
-butil::atomic<size_t> g_request_idx(0);
-
-int LoadTestData() {
-    std::ifstream input(FLAGS_data_file, std::ios::binary);
-    if (!input) { LOG(ERROR) << "No data file"; return -1; }
-    press_test::Requests collection;
-    if (!collection.ParseFromIstream(&input)) return -1;
-    for (int i = 0; i < collection.requests_size(); ++i) {
-        g_pregenerated_requests.push_back(collection.requests(i));
-    }
-    return g_pregenerated_requests.empty() ? -1 : 0;
-}
 
 bvar::LatencyRecorder g_latency_recorder("client");
 bvar::LatencyRecorder g_server_cpu_recorder("server_cpu");
@@ -95,6 +79,32 @@ enum PayloadMode {
 };
 
 PayloadMode g_payload_mode = PAYLOAD_MODE_MESSAGE;
+std::string g_global_payload;
+std::vector<press_test::Request> g_pregenerated_requests;
+butil::atomic<size_t> g_request_idx(0);
+
+int LoadTestData() {
+    if (g_payload_mode == PAYLOAD_MODE_MESSAGE && FLAGS_attachment_size > 0) {
+        g_global_payload.resize(FLAGS_attachment_size);
+        butil::fast_rand_bytes(&g_global_payload[0], FLAGS_attachment_size);
+    }
+    std::ifstream input(FLAGS_data_file, std::ios::binary);
+    if (!input) { LOG(ERROR) << "No data file"; return -1; }
+    press_test::Requests collection;
+    if (!collection.ParseFromIstream(&input)) return -1;
+    for (int i = 0; i < collection.requests_size(); ++i) {
+        press_test::Request& req = *collection.mutable_requests(i);
+        req.set_echo_attachment(FLAGS_echo_attachment);
+        
+        if (g_payload_mode == PAYLOAD_MODE_MESSAGE) {
+            req.set_payload(g_global_payload);
+        } else {
+            req.clear_payload();
+        }
+        g_pregenerated_requests.push_back(req);
+    }
+    return g_pregenerated_requests.empty() ? -1 : 0;
+}
 
 std::string ToLower(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(),
@@ -246,13 +256,10 @@ public:
         closure->cntl->set_request_compress_type(g_request_compress_type);
 
         size_t idx = g_request_idx.fetch_add(1, butil::memory_order_relaxed) % g_pregenerated_requests.size();
-        press_test::Request request = g_pregenerated_requests[idx]; // 拷贝一份以便修改
+        const press_test::Request& request = g_pregenerated_requests[idx];
         
-        request.set_echo_attachment(_echo_attachment);
-        if (g_payload_mode == PAYLOAD_MODE_MESSAGE) {
-            request.set_payload(_payload);
-        } else {
-            closure->cntl->request_attachment().append(_attachment);
+        if (g_payload_mode == PAYLOAD_MODE_ATTACHMENT) {
+        closure->cntl->request_attachment().append(_attachment);
         }
         closure->test = this;
         google::protobuf::Closure* done = brpc::NewCallback(&HandleResponse, closure);
@@ -422,7 +429,6 @@ void Test(int thread_num, int attachment_size) {
 }
 
 int main(int argc, char* argv[]) {
-    if (LoadTestData() != 0) return -1;
     GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
     brpc::GlobalInitializeOrDie();
 
@@ -440,6 +446,11 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << "payload_mode=attachment does not exercise brpc RPC compression, "
                    << "because attachments are appended outside the compressed protobuf body. "
                    << "Use --payload_mode=message when request_compress_type is not none.";
+        return -1;
+    }
+
+    if (LoadTestData() != 0) {
+        LOG(ERROR) << "Failed to load test data";
         return -1;
     }
 
@@ -479,12 +490,3 @@ int main(int argc, char* argv[]) {
 
     return 0;
 }
-
-#else
-
-int main(int argc, char* argv[]) {
-    LOG(ERROR) << " brpc is not compiled with rdma. To enable it, please refer to https://github.com/apache/brpc/blob/master/docs/en/rdma.md";
-    return 0;
-}
-
-#endif
