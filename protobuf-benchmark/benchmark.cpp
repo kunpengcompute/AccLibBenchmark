@@ -145,26 +145,115 @@ std::string loadTestBuf(int len, std::string cycle) {
     return data;
 }
 
-static void BM_StrSerialization(benchmark::State& state) {
-    auto data_size = state.range(0);
-    pb::test::Person test_data = makeStrData(loadTestBuf(data_size, "\xF0\x90\xBF\x80"));
-    std::string serialized_data;
-    for (auto _ : state) {
-        test_data.SerializeToString(&serialized_data);
+// static void BM_StrSerialization(benchmark::State& state) {
+//     auto data_size = state.range(0);
+//     pb::test::Person test_data = makeStrData(loadTestBuf(data_size, "\xF0\x90\xBF\x80"));
+//     std::string serialized_data;
+//     for (auto _ : state) {
+//         test_data.SerializeToString(&serialized_data);
+//     }
+//     state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(data_size));
+// }
+
+// static void BM_StrDeserialization(benchmark::State& state) {
+//     auto data_size = state.range(0);
+//     pb::test::Person test_data = makeStrData(loadTestBuf(data_size, "\xF0\x90\xBF\x80"));
+//     pb::test::Person test_data2;
+//     std::string serialized_data;
+//     test_data.SerializeToString(&serialized_data);
+//     for (auto _ : state) {
+//         test_data2.ParseFromString(serialized_data);
+//     }
+//     state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(data_size));
+// }
+
+enum class Scene { kPureAscii = 0, kPureUtf8 = 1, kMixed = 2 };
+
+std::string GenerateFlexibleData(size_t target_size, Scene scene) {
+    std::string result;
+    result.reserve(target_size);
+    
+    // 固定种子保证测试可重复性
+    std::mt19937 gen(42); 
+    
+    // 定义不同场景下的 ASCII 占比
+    float ascii_ratio = (scene == Scene::kPureAscii) ? 1.0f : 
+                        (scene == Scene::kPureUtf8)  ? 0.0f : 0.5f;
+
+    // 多字节 UTF-8 样本库
+    std::vector<std::string> utf8_samples = {
+        "\xC2\xA2",             // 2-byte
+        "\xE2\x82\xAC",         // 3-byte
+        "\xF0\x90\xBF\x80"      // 4-byte
+    };
+    
+    std::uniform_real_distribution<float> dist(0.0, 1.0);
+
+    while (result.size() < target_size) {
+        if (dist(gen) < ascii_ratio) {
+            // 随机生成一个合法 ASCII 字符 (0-127)
+            result.push_back(static_cast<char>(gen() % 128));
+        } else {
+            // 随机选择一个多字节序列
+            const std::string& sample = utf8_samples[gen() % utf8_samples.size()];
+            if (result.size() + sample.size() <= target_size) {
+                result.append(sample);
+            } else {
+                // 空间不足时补 ASCII
+                result.push_back(' ');
+            }
+        }
     }
-    state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(data_size));
+    return result;
 }
 
+
+// --- Serialization Benchmark ---
+static void BM_StrSerialization(benchmark::State& state) {
+    auto data_size = state.range(0);
+    auto scene = static_cast<Scene>(state.range(1));
+    
+    // 使用灵活长度生成器构造内容
+    std::string content = GenerateFlexibleData(data_size, scene);
+    pb::test::Person test_data = makeStrData(content);
+    
+    std::string serialized_data;
+    for (auto _ : state) {
+        serialized_data.clear();
+        test_data.SerializeToString(&serialized_data);
+        benchmark::DoNotOptimize(serialized_data);
+    }
+    state.SetBytesProcessed(state.iterations() * data_size);
+}
+
+// --- Deserialization Benchmark ---
 static void BM_StrDeserialization(benchmark::State& state) {
     auto data_size = state.range(0);
-    pb::test::Person test_data = makeStrData(loadTestBuf(data_size, "\xF0\x90\xBF\x80"));
-    pb::test::Person test_data2;
+    auto scene = static_cast<Scene>(state.range(1));
+    
+    std::string content = GenerateFlexibleData(data_size, scene);
+    pb::test::Person test_data = makeStrData(content);
+    
     std::string serialized_data;
     test_data.SerializeToString(&serialized_data);
+    
+    pb::test::Person test_data2;
     for (auto _ : state) {
+        test_data2.Clear();
         test_data2.ParseFromString(serialized_data);
+        benchmark::DoNotOptimize(test_data2);
     }
-    state.SetBytesProcessed(state.iterations() * static_cast<int64_t>(data_size));
+    state.SetBytesProcessed(state.iterations() * serialized_data.size());
+}
+
+// --- 注册参数：覆盖 12 个长度和 3 个场景 ---
+void CustomArguments(benchmark::internal::Benchmark* b) {
+    std::vector<int64_t> lengths = {4, 8, 16, 32, 64, 128, 160, 256, 512, 1024, 1048576, 4194304};
+    for (auto len : lengths) {
+        for (int scene = 0; scene <= 2; ++scene) {
+            b->Args({len, scene});
+        }
+    }
 }
 
 // 1. Varint 32 Serialize
@@ -218,7 +307,9 @@ DEFINE_DOUBLE_DESERIALIZE_BENCHMARK(128)
 DEFINE_DOUBLE_DESERIALIZE_BENCHMARK(256)
 
 // 7. String Benchmarks
-BENCHMARK(BM_StrSerialization)->Arg(4)->Arg(8)->Arg(16)->Arg(32)->Arg(64);
-BENCHMARK(BM_StrDeserialization)->Arg(4)->Arg(8)->Arg(16)->Arg(32)->Arg(64);
+// BENCHMARK(BM_StrSerialization)->Arg(4)->Arg(8)->Arg(16)->Arg(32)->Arg(64);
+// BENCHMARK(BM_StrDeserialization)->Arg(4)->Arg(8)->Arg(16)->Arg(32)->Arg(64);
+BENCHMARK(BM_StrSerialization)->Apply(CustomArguments)->Unit(benchmark::kNanosecond);
+BENCHMARK(BM_StrDeserialization)->Apply(CustomArguments)->Unit(benchmark::kNanosecond);
 
 BENCHMARK_MAIN();
