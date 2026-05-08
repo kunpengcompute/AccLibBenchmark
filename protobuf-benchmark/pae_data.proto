@@ -1,0 +1,51 @@
+syntax = "proto3";
+
+package idl.lagrange.common;
+option cc_enable_arenas = true;
+
+
+message GPUTransBiasMeta {
+    // feature column tensor name 
+    repeated string fc_name = 1;
+    repeated int32 output_id = 2;
+}
+
+message GPUTransVecMeta {
+    // feature column tensor name 
+    repeated string fc_name = 1;
+    repeated int32 meta_dim = 2;
+    repeated int32 meta_size = 3;
+    repeated int32 input_offset = 4;
+    repeated int32 output_offset = 5;
+}
+
+message GPUTrans3DMeta {
+    // feature column tensor name 
+    repeated string fc_name = 1;
+    repeated int32 input_offset = 2;
+    repeated int32 output_id = 3;
+    repeated int32 feature_size = 4;
+}
+
+message GPUTransLayerMeta {
+    // input name, tensor name of the input 
+    string name = 1;
+    // emb name 
+    string emb_name = 2;
+    int32 data_size = 3;
+    bool shared = 5;
+    bool empty = 6;
+    bool tiling_in_graph = 7;
+
+    oneof meta {
+        GPUTransBiasMeta bias = 9;
+        GPUTransVecMeta vec = 10;
+        GPUTrans3DMeta seq = 11;
+    }
+};
+
+// inference meta: marine -> pilot
+message InferenceMeta {
+    int32 batch_size = 1;
+    repeated GPUTransLayerMeta emb_meta = 2;
+}
