@@ -1,0 +1,6 @@
+syntax = "proto3";
+package pb.test;
+
+message ArrSFixed32 {
+    repeated sfixed32 numbers = 1 [packed=true];
+}

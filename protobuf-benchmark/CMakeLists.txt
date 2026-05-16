@@ -6,7 +6,7 @@ if(NOT DEFINED ENV{PBLIB_HOME})
 endif()
 
 # 批量检查并生成 Protobuf 源文件
-foreach(PROTO_FILE arr_double arr_data32 arr_data64 pae_data string)
+foreach(PROTO_FILE arr_double arr_data32 arr_data64 pae_data string arr_fixed32 arr_fixed64 arr_sfixed32 arr_sfixed64 arr_float press)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/${PROTO_FILE}.pb.h")
         message(STATUS "${PROTO_FILE}.pb.h not found. Generating...")
         execute_process(
@@ -22,7 +22,8 @@ foreach(PROTO_FILE arr_double arr_data32 arr_data64 pae_data string)
     endif()
 endforeach()
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
 
 link_directories("$ENV{PBLIB_HOME}/lib64" "$ENV{PBLIB_HOME}/lib")
@@ -35,7 +36,7 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -g -O3 -Wall -march=armv8.5-a+sve+sve2+sve2-bitperm")
 endif()
 
-add_executable(bm benchmark.cpp arr_double.pb.cc arr_data32.pb.cc arr_data64.pb.cc pae_data.pb.cc string.pb.cc)
+add_executable(bm benchmark_press.cpp benchmark_varint.cpp benchmark_fixed.cpp benchmark_string.cpp arr_double.pb.cc arr_data32.pb.cc arr_data64.pb.cc pae_data.pb.cc string.pb.cc arr_fixed32.pb.cc arr_fixed64.pb.cc arr_sfixed32.pb.cc arr_sfixed64.pb.cc arr_float.pb.cc press.pb.cc)
 
 target_link_libraries(bm 
     benchmark 
@@ -45,4 +46,6 @@ target_link_libraries(bm
     absl_log_internal_message 
     absl_log_internal_nullguard
     absl_raw_logging_internal
+    absl_hash
+    absl_flags_reflection
 )
