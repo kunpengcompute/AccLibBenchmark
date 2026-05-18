@@ -25,8 +25,11 @@
 #include <fstream>
 #include <iostream>
 #include <memory>
+#include <mutex>
+#include <iomanip>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <gflags/gflags.h>
@@ -58,6 +61,12 @@ DEFINE_int32(rpc_timeout_ms, 2000, "RPC call timeout");
 DEFINE_int32(connect_timeout_ms, -1,
              "Connection establishment timeout. -1 means use rpc_timeout_ms");
 DEFINE_int32(test_seconds, 20, "Test running time");
+DEFINE_int32(stop_grace_ms, 5000,
+             "Max time to wait for in-flight RPCs after test_seconds is reached");
+DEFINE_bool(cancel_inflight_on_stop, true,
+            "Cancel outstanding asynchronous RPCs when the timed test stops");
+DEFINE_bool(log_rpc_error, false,
+            "Print each failed RPC. Disabled by default to avoid log flooding under overload");
 DEFINE_int32(test_iterations, 0, "Total request budget, 0 means time-based run");
 DEFINE_int32(dummy_port, 8001, "Dummy server port number");
 DEFINE_string(load_mode, "closed_loop", "Load mode of the client: closed_loop or open_loop");
@@ -65,7 +74,7 @@ DEFINE_int32(connection_num, 0, "How many Channel instances should be created");
 DEFINE_int32(max_inflight, 0, "Global inflight limit in open_loop mode");
 DEFINE_bool(unique_connection_group, false,
             "Create a unique connection_group per Channel to prevent SocketMap reuse");
-DEFINE_bool(report_connection_stats, true, "Print connection-level counters");
+DEFINE_bool(report_connection_stats, false, "Print connection-level counters");
 DEFINE_string(payload_format, "attachment",
               "Payload format: attachment or raw_json");
 DEFINE_string(json_file, "", "Read raw JSON request body from this file");
@@ -89,6 +98,8 @@ butil::atomic<int64_t> g_open_loop_inflight_limit(0);
 std::vector<std::string> g_servers;
 std::string g_json_payload;
 volatile bool g_stop = false;
+std::mutex g_call_ids_mutex;
+std::unordered_set<uint64_t> g_call_ids;
 
 namespace {
 
@@ -130,6 +141,7 @@ struct RespClosure {
     test::PerfTestResponse* resp;
     Worker* worker;
     ConnectionSlot* slot;
+    brpc::CallId call_id;
 };
 
 struct Worker {
@@ -320,6 +332,46 @@ static void ReleaseInflightPermit() {
     g_inflight.fetch_sub(1, butil::memory_order_relaxed);
 }
 
+static void RegisterCallId(brpc::CallId id) {
+    std::lock_guard<std::mutex> lock(g_call_ids_mutex);
+    g_call_ids.insert(id.value);
+}
+
+static void UnregisterCallId(brpc::CallId id) {
+    std::lock_guard<std::mutex> lock(g_call_ids_mutex);
+    g_call_ids.erase(id.value);
+}
+
+static void CancelOutstandingRpc() {
+    std::vector<uint64_t> ids;
+    {
+        std::lock_guard<std::mutex> lock(g_call_ids_mutex);
+        ids.assign(g_call_ids.begin(), g_call_ids.end());
+    }
+    for (size_t i = 0; i < ids.size(); ++i) {
+        brpc::CallId id = { ids[i] };
+        brpc::StartCancel(id);
+    }
+    if (!ids.empty()) {
+        LOG(WARNING) << "Canceled " << ids.size() << " outstanding RPCs";
+    }
+}
+
+static std::string FormatQps(uint64_t completed_count, uint64_t elapsed_us) {
+    if (elapsed_us == 0) {
+        return "0.000";
+    }
+    const double qps = completed_count * 1000000.0 / elapsed_us;
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(3);
+    if (qps >= 1000.0) {
+        oss << qps / 1000.0 << "k";
+    } else {
+        oss << qps;
+    }
+    return oss.str();
+}
+
 static void UpdateClientCpuSample() {
     uint64_t last = g_last_time.load(butil::memory_order_relaxed);
     uint64_t now = NowUs();
@@ -380,6 +432,7 @@ static void HandleResponse(RespClosure* closure) {
     ConnectionSlot* slot = closure->slot;
     Worker* worker = closure->worker;
 
+    UnregisterCallId(closure->call_id);
     ReleaseInflightPermit();
 
     if (closure->cntl->Failed()) {
@@ -390,7 +443,9 @@ static void HandleResponse(RespClosure* closure) {
             slot->timeouts.fetch_add(1, butil::memory_order_relaxed);
             g_timeout_cnt.fetch_add(1, butil::memory_order_relaxed);
         }
-        LOG(ERROR) << "RPC call failed: " << closure->cntl->ErrorText();
+        if (FLAGS_log_rpc_error && !g_stop) {
+            LOG(ERROR) << "RPC call failed: " << closure->cntl->ErrorText();
+        }
         ContinueClosedLoopIfNeeded(worker);
         return;
     }
@@ -417,7 +472,9 @@ static void HandleResponse(RespClosure* closure) {
             if (response_body != g_json_payload) {
                 slot->failed.fetch_add(1, butil::memory_order_relaxed);
                 g_failed_cnt.fetch_add(1, butil::memory_order_relaxed);
-                LOG(ERROR) << "Raw JSON echo check failed";
+                if (!g_stop) {
+                    LOG(ERROR) << "Raw JSON echo check failed";
+                }
                 ContinueClosedLoopIfNeeded(worker);
                 return;
             }
@@ -453,6 +510,8 @@ static bool SendRequest(Worker* worker) {
     closure->slot = slot;
     closure->cntl = new brpc::Controller();
     closure->resp = IsRawJsonPayload() ? NULL : new test::PerfTestResponse();
+    closure->call_id = closure->cntl->call_id();
+    RegisterCallId(closure->call_id);
     if (IsRawJsonPayload()) {
         closure->cntl->http_request().uri() = std::string(kRawJsonPath) +
                 "?echo_attachment=" + (worker->echo_attachment_flag ? "true" : "false");
@@ -612,6 +671,9 @@ static void Test(int thread_num, int attachment_size) {
               << ", ConnectionNum: " << actual_connection_num
               << ", RpcTimeoutMs: " << FLAGS_rpc_timeout_ms
               << ", ConnectTimeoutMs: " << connect_timeout_ms
+              << ", StopGraceMs: " << FLAGS_stop_grace_ms
+              << ", CancelInflightOnStop: "
+              << (FLAGS_cancel_inflight_on_stop ? "true" : "false")
               << ", UniqueConnectionGroup: "
               << (FLAGS_unique_connection_group ? "true" : "false")
               << ", ModelConcurrency: "
@@ -673,6 +735,9 @@ static void Test(int thread_num, int attachment_size) {
         bthread_start_background(&tids[k], &BTHREAD_ATTR_NORMAL, fn, workers[k]);
     }
 
+    bool canceled_inflight = false;
+    bool stop_grace_expired = false;
+    uint64_t stop_time_us = 0;
     while (true) {
         bool all_workers_stopped = true;
         for (int k = 0; k < thread_num; ++k) {
@@ -690,6 +755,21 @@ static void Test(int thread_num, int attachment_size) {
         }
         if (FLAGS_test_seconds > 0 && ShouldStopByTime(start_time)) {
             g_stop = true;
+            if (stop_time_us == 0) {
+                stop_time_us = NowUs();
+            }
+            if (FLAGS_cancel_inflight_on_stop && !canceled_inflight) {
+                canceled_inflight = true;
+                CancelOutstandingRpc();
+            }
+            if (!no_more_inflight && FLAGS_stop_grace_ms >= 0 &&
+                NowUs() - stop_time_us >= (uint64_t)FLAGS_stop_grace_ms * 1000UL) {
+                stop_grace_expired = true;
+                LOG(ERROR) << "Stop grace expired with inflight="
+                           << g_inflight.load(butil::memory_order_relaxed)
+                           << ". Printing summary and exiting.";
+                break;
+            }
         }
         bthread_usleep(10000);
     }
@@ -706,10 +786,9 @@ static void Test(int thread_num, int attachment_size) {
                   << ", 99th-Latency: " << g_latency_recorder.latency_percentile(0.99)
                   << ", 99.9th-Latency: " << g_latency_recorder.latency_percentile(0.999)
                   << ", Throughput: " << throughput << "MB/s"
-                  << ", QPS: "
-                  << (g_total_cnt.load(butil::memory_order_relaxed) * 1000 /
-                      (end_time - start_time))
-                  << "k"
+                  << ", QPS: " << FormatQps(
+                          g_total_cnt.load(butil::memory_order_relaxed),
+                          end_time - start_time)
                   << ", Failed: " << g_failed_cnt.load(butil::memory_order_relaxed)
                   << ", Timeout: " << g_timeout_cnt.load(butil::memory_order_relaxed)
                   << ", PeakInflight: " << g_peak_inflight.load(butil::memory_order_relaxed)
@@ -725,6 +804,11 @@ static void Test(int thread_num, int attachment_size) {
     }
 
     PrintConnectionStats();
+
+    if (stop_grace_expired) {
+        fflush(NULL);
+        _exit(0);
+    }
 
     g_stop = true;
     for (int k = 0; k < thread_num; ++k) {
@@ -755,6 +839,10 @@ int main(int argc, char* argv[]) {
     }
     if (FLAGS_connect_timeout_ms < -1) {
         LOG(ERROR) << "connect_timeout_ms must be >= -1";
+        return -1;
+    }
+    if (FLAGS_stop_grace_ms < -1) {
+        LOG(ERROR) << "stop_grace_ms must be >= -1";
         return -1;
     }
 
