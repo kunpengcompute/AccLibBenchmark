@@ -63,8 +63,9 @@ DEFINE_int32(connect_timeout_ms, -1,
 DEFINE_int32(test_seconds, 20, "Test running time");
 DEFINE_int32(stop_grace_ms, 5000,
              "Max time to wait for in-flight RPCs after test_seconds is reached");
-DEFINE_bool(cancel_inflight_on_stop, true,
-            "Cancel outstanding asynchronous RPCs when the timed test stops");
+DEFINE_bool(cancel_inflight_on_stop, false,
+            "Cancel outstanding asynchronous RPCs when the timed test stops. "
+            "Disabled by default to avoid per-RPC tracking overhead");
 DEFINE_bool(log_rpc_error, false,
             "Print each failed RPC. Disabled by default to avoid log flooding under overload");
 DEFINE_int32(test_iterations, 0, "Total request budget, 0 means time-based run");
@@ -80,8 +81,12 @@ DEFINE_string(payload_format, "attachment",
 DEFINE_string(json_file, "", "Read raw JSON request body from this file");
 DEFINE_bool(json_echo_check, false,
             "Check raw JSON response body equals request body when echo_attachment is true");
+DEFINE_string(response_mode, "normal",
+              "Response handling mode for protobuf payload: normal or minimal");
+DEFINE_bool(record_latency, true,
+            "Record latency percentiles. Disable for max-throughput tests to reduce client-side stats overhead");
 
-bvar::LatencyRecorder g_latency_recorder("client");
+std::unique_ptr<bvar::LatencyRecorder> g_latency_recorder;
 bvar::LatencyRecorder g_server_cpu_recorder("server_cpu");
 bvar::LatencyRecorder g_client_cpu_recorder("client_cpu");
 butil::atomic<uint64_t> g_last_time(0);
@@ -107,6 +112,8 @@ const char* kClosedLoop = "closed_loop";
 const char* kOpenLoop = "open_loop";
 const char* kPayloadAttachment = "attachment";
 const char* kPayloadRawJson = "raw_json";
+const char* kResponseModeNormal = "normal";
+const char* kResponseModeMinimal = "minimal";
 const char* kRawJsonPath = "/test.PerfTestService/Test";
 
 struct ConnectionSlot {
@@ -142,6 +149,7 @@ struct RespClosure {
     Worker* worker;
     ConnectionSlot* slot;
     brpc::CallId call_id;
+    bool track_call_id;
 };
 
 struct Worker {
@@ -190,6 +198,18 @@ static bool IsRawJsonPayload() {
 
 static bool IsAttachmentPayload() {
     return FLAGS_payload_format == kPayloadAttachment;
+}
+
+static bool IsMinimalResponseMode() {
+    return FLAGS_response_mode == kResponseModeMinimal;
+}
+
+static bool IsNormalResponseMode() {
+    return FLAGS_response_mode == kResponseModeNormal;
+}
+
+static int LatencyWindowSeconds() {
+    return FLAGS_test_seconds > 0 ? FLAGS_test_seconds : 10;
 }
 
 static std::string LowerString(const std::string& value) {
@@ -304,28 +324,13 @@ static bool TryAcquireRequestPermit(uint64_t start_time_us) {
     if (g_stop || ShouldStopByTime(start_time_us)) {
         return false;
     }
+    if (!ConsumeRequestBudget()) {
+        return false;
+    }
     if (!AcquireQpsToken()) {
         return false;
     }
     return true;
-}
-
-static bool TryAcquireInflightPermit(int64_t limit) {
-    if (limit <= 0) {
-        const int64_t inflight =
-                g_inflight.fetch_add(1, butil::memory_order_relaxed) + 1;
-        UpdatePeakInflight(inflight);
-        return true;
-    }
-    int64_t old_value = g_inflight.load(butil::memory_order_relaxed);
-    while (old_value < limit) {
-        if (g_inflight.compare_exchange_weak(
-                    old_value, old_value + 1, butil::memory_order_relaxed)) {
-            UpdatePeakInflight(old_value + 1);
-            return true;
-        }
-    }
-    return false;
 }
 
 static void ReleaseInflightPermit() {
@@ -399,13 +404,6 @@ static void* GenerateToken(void* arg) {
     return NULL;
 }
 
-static int64_t GetEffectiveInflightLimit() {
-    if (!IsOpenLoop()) {
-        return 0;
-    }
-    return g_open_loop_inflight_limit.load(butil::memory_order_relaxed);
-}
-
 static bool SendRequest(Worker* worker);
 
 static bool ShouldStopWorkerAfterResponse(Worker* worker) {
@@ -432,7 +430,9 @@ static void HandleResponse(RespClosure* closure) {
     ConnectionSlot* slot = closure->slot;
     Worker* worker = closure->worker;
 
-    UnregisterCallId(closure->call_id);
+    if (closure->track_call_id) {
+        UnregisterCallId(closure->call_id);
+    }
     ReleaseInflightPermit();
 
     if (closure->cntl->Failed()) {
@@ -451,8 +451,13 @@ static void HandleResponse(RespClosure* closure) {
     }
 
     slot->completed.fetch_add(1, butil::memory_order_relaxed);
-    g_latency_recorder << closure->cntl->latency_us();
-    if (!IsRawJsonPayload() && !closure->resp->cpu_usage().empty()) {
+    if (FLAGS_record_latency) {
+        if (g_latency_recorder) {
+            *g_latency_recorder << closure->cntl->latency_us();
+        }
+    }
+    if (!IsRawJsonPayload() && closure->resp != NULL &&
+        !closure->resp->cpu_usage().empty()) {
         g_server_cpu_recorder << atof(closure->resp->cpu_usage().c_str()) * 100;
     } else if (IsRawJsonPayload()) {
         const std::string* cpu_header =
@@ -494,24 +499,20 @@ static bool SendRequest(Worker* worker) {
         worker->stop = true;
         return false;
     }
-    const int64_t inflight_limit = GetEffectiveInflightLimit();
-    if (!TryAcquireInflightPermit(inflight_limit)) {
-        return false;
-    }
-    if (!ConsumeRequestBudget()) {
-        ReleaseInflightPermit();
-        worker->stop = true;
-        return false;
-    }
 
     ConnectionSlot* slot = PickConnectionSlot();
     RespClosure* closure = new RespClosure;
     closure->worker = worker;
     closure->slot = slot;
     closure->cntl = new brpc::Controller();
-    closure->resp = IsRawJsonPayload() ? NULL : new test::PerfTestResponse();
-    closure->call_id = closure->cntl->call_id();
-    RegisterCallId(closure->call_id);
+    closure->resp =
+            (IsRawJsonPayload() || IsMinimalResponseMode()) ?
+            NULL : new test::PerfTestResponse();
+    closure->track_call_id = FLAGS_cancel_inflight_on_stop;
+    if (closure->track_call_id) {
+        closure->call_id = closure->cntl->call_id();
+        RegisterCallId(closure->call_id);
+    }
     if (IsRawJsonPayload()) {
         closure->cntl->http_request().uri() = std::string(kRawJsonPath) +
                 "?echo_attachment=" + (worker->echo_attachment_flag ? "true" : "false");
@@ -521,11 +522,14 @@ static bool SendRequest(Worker* worker) {
     }
     google::protobuf::Closure* done = brpc::NewCallback(&HandleResponse, closure);
     slot->sent.fetch_add(1, butil::memory_order_relaxed);
+    int64_t inflight = g_inflight.fetch_add(1, butil::memory_order_relaxed) + 1;
+    UpdatePeakInflight(inflight);
     if (IsRawJsonPayload()) {
         slot->channel->CallMethod(NULL, closure->cntl, NULL, NULL, done);
     } else {
         test::PerfTestRequest request;
         request.set_echo_attachment(worker->echo_attachment_flag);
+        request.set_minimal_response(IsMinimalResponseMode());
         closure->cntl->request_attachment().append(worker->attachment);
         test::PerfTestService_Stub stub(slot->channel);
         stub.Test(closure->cntl, &request, closure->resp, done);
@@ -612,8 +616,10 @@ static int InitConnectionSlots(int connection_num, bool echo_attachment) {
             test::PerfTestResponse response;
             test::PerfTestRequest request;
             request.set_echo_attachment(echo_attachment);
+            request.set_minimal_response(IsMinimalResponseMode());
             test::PerfTestService_Stub stub(slot->channel);
-            stub.Test(&cntl, &request, &response, NULL);
+            stub.Test(&cntl, &request,
+                      IsMinimalResponseMode() ? NULL : &response, NULL);
         }
         if (cntl.Failed()) {
             LOG(ERROR) << "Warmup RPC failed on connection " << i << ": "
@@ -666,6 +672,8 @@ static void Test(int thread_num, int attachment_size) {
               << ", RDMA: " << (FLAGS_use_rdma ? "yes" : "no")
               << ", Echo: " << (FLAGS_echo_attachment ? "yes" : "no")
               << ", PayloadFormat: " << FLAGS_payload_format
+              << ", ResponseMode: " << FLAGS_response_mode
+              << ", RecordLatency: " << (FLAGS_record_latency ? "true" : "false")
               << ", LoadMode: " << FLAGS_load_mode
               << ", ConnectionType: " << FLAGS_connection_type
               << ", ConnectionNum: " << actual_connection_num
@@ -711,6 +719,12 @@ static void Test(int thread_num, int attachment_size) {
     g_rr_index.store(0, butil::memory_order_relaxed);
     g_open_loop_inflight_limit.store(
             open_loop_inflight_limit, butil::memory_order_relaxed);
+    if (FLAGS_record_latency) {
+        g_latency_recorder.reset(
+                new bvar::LatencyRecorder("client", LatencyWindowSeconds()));
+    } else {
+        g_latency_recorder.reset();
+    }
 
     if (InitConnectionSlots(actual_connection_num, FLAGS_echo_attachment) < 0) {
         DestroyConnectionSlots();
@@ -781,19 +795,32 @@ static void Test(int thread_num, int attachment_size) {
                      1.048576 / (end_time - start_time);
     }
     if (FLAGS_test_iterations == 0) {
-        std::cout << "Avg-Latency: " << g_latency_recorder.latency(10)
-                  << ", 90th-Latency: " << g_latency_recorder.latency_percentile(0.9)
-                  << ", 99th-Latency: " << g_latency_recorder.latency_percentile(0.99)
-                  << ", 99.9th-Latency: " << g_latency_recorder.latency_percentile(0.999)
-                  << ", Throughput: " << throughput << "MB/s"
+        if (FLAGS_record_latency && g_latency_recorder) {
+            std::cout << "Avg-Latency: " << g_latency_recorder->latency()
+                      << ", 90th-Latency: " << g_latency_recorder->latency_percentile(0.9)
+                      << ", 99th-Latency: " << g_latency_recorder->latency_percentile(0.99)
+                      << ", 99.9th-Latency: " << g_latency_recorder->latency_percentile(0.999);
+        } else {
+            std::cout << "Avg-Latency: N/A"
+                      << ", 90th-Latency: N/A"
+                      << ", 99th-Latency: N/A"
+                      << ", 99.9th-Latency: N/A";
+        }
+        std::cout << ", Throughput: " << throughput << "MB/s"
                   << ", QPS: " << FormatQps(
                           g_total_cnt.load(butil::memory_order_relaxed),
                           end_time - start_time)
                   << ", Failed: " << g_failed_cnt.load(butil::memory_order_relaxed)
                   << ", Timeout: " << g_timeout_cnt.load(butil::memory_order_relaxed)
                   << ", PeakInflight: " << g_peak_inflight.load(butil::memory_order_relaxed)
-                  << ", Server CPU-utilization: " << g_server_cpu_recorder.latency(10) << "%"
-                  << ", Client CPU-utilization: " << g_client_cpu_recorder.latency(10) << "%"
+                  << ", Server CPU-utilization: ";
+        if (!IsRawJsonPayload() && IsMinimalResponseMode()) {
+            std::cout << "N/A";
+        } else {
+            std::cout << g_server_cpu_recorder.latency(10) << "%";
+        }
+        std::cout << ", Client CPU-utilization: "
+                  << g_client_cpu_recorder.latency(10) << "%"
                   << std::endl;
     } else {
         std::cout << "Throughput: " << throughput << "MB/s"
@@ -830,6 +857,15 @@ int main(int argc, char* argv[]) {
     if (!IsAttachmentPayload() && !IsRawJsonPayload()) {
         LOG(ERROR) << "Invalid payload_format=" << FLAGS_payload_format
                    << ", valid values are attachment and raw_json";
+        return -1;
+    }
+    if (!IsNormalResponseMode() && !IsMinimalResponseMode()) {
+        LOG(ERROR) << "Invalid response_mode=" << FLAGS_response_mode
+                   << ", valid values are normal and minimal";
+        return -1;
+    }
+    if (IsRawJsonPayload() && IsMinimalResponseMode()) {
+        LOG(ERROR) << "response_mode=minimal is only supported for protobuf attachment payloads";
         return -1;
     }
     if (IsRawJsonPayload() && !IsRawJsonProtocolAllowed()) {
