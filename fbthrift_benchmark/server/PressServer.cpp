@@ -1,3 +1,6 @@
+#include <signal.h>
+#include <atomic>
+
 #include <glog/logging.h>
 #include <folly/init/Init.h>
 #include <folly/portability/GFlags.h>
@@ -5,13 +8,90 @@
 #include <thrift/lib/cpp2/transport/rocket/server/RocketRoutingHandler.h>
 
 #include "server/PerfTestService.h"
-
+#include "util/ResourceMonitor.h"
+#include <thrift/lib/cpp2/gen/client_cpp.h>
 DEFINE_int32(port, 8002, "TCP Port of this server");
-DEFINE_int32(num_threads, 8, "Number of IO and CPU worker threads");
+DEFINE_int32(num_io_threads, 1, "Number of IO worker threads");
+DEFINE_int32(num_cpu_threads, 1, "Number of CPU worker threads");
 
 using apache::thrift::RocketRoutingHandler;
 using apache::thrift::ThriftServer;
 using press_test::PerfTestServiceHandler;
+
+std::shared_ptr<ThriftServer> g_server;
+std::atomic<bool> g_stop_requested{false};
+
+void printHeaderCompressionStats(){
+  LOG(INFO) << "====== Server Header Compression Stats =======";
+  LOG(INFO) << "Header Compression (us):"
+            << " avg=" << std::fixed << std::setprecision(2) << apache::thrift::transport::getHeaderCompressionAvg()
+            << std::fixed << std::setprecision(0)
+            << " p50=" << apache::thrift::transport::getHeaderCompressionP50()
+            << " p90=" << apache::thrift::transport::getHeaderCompressionP90()
+            << " p99=" << apache::thrift::transport::getHeaderCompressionP99()
+            << " p999=" << apache::thrift::transport::getHeaderCompressionP999();
+  LOG(INFO) << "Header Decompression (us):"
+            << " avg=" << std::fixed << std::setprecision(2) << apache::thrift::transport::getHeaderDecompressionAvg()
+            << std::fixed << std::setprecision(0)
+            << " p50=" << apache::thrift::transport::getHeaderDecompressionP50()
+            << " p90=" << apache::thrift::transport::getHeaderDecompressionP90()
+            << " p99=" << apache::thrift::transport::getHeaderDecompressionP99()
+            << " p999=" << apache::thrift::transport::getHeaderDecompressionP999();
+}
+
+void printRocketCompressionStats(){
+  LOG(INFO) << "====== Server Rocket Compression Stats =======";
+  LOG(INFO) << "Rocket Compression (us):"
+            << " avg=" << std::fixed << std::setprecision(2) << apache::thrift::rocket::getRocketCompressionAvg()
+            << std::fixed << std::setprecision(0)
+            << " p50=" << apache::thrift::rocket::getRocketCompressionP50()
+            << " p90=" << apache::thrift::rocket::getRocketCompressionP90()
+            << " p99=" << apache::thrift::rocket::getRocketCompressionP99()
+            << " p999=" << apache::thrift::rocket::getRocketCompressionP999();
+  LOG(INFO) << "Rocket Decompression (us):"
+            << " avg=" << std::fixed << std::setprecision(2) << apache::thrift::rocket::getRocketDecompressionAvg()
+            << std::fixed << std::setprecision(0)
+            << " p50=" << apache::thrift::rocket::getRocketDecompressionP50()
+            << " p90=" << apache::thrift::rocket::getRocketDecompressionP90()
+            << " p99=" << apache::thrift::rocket::getRocketDecompressionP99()
+            << " p999=" << apache::thrift::rocket::getRocketDecompressionP999();
+}
+
+void printRequestDeserializationStats(){
+  LOG(INFO) << "====== Server Request Deserialization Stats =======";
+  LOG(INFO) << "Request Deserialization (us):"
+            << " avg=" << std::fixed << std::setprecision(2) << apache::thrift::getRequestDeserializationAvg()
+            << std::fixed << std::setprecision(0)
+            << " p50=" << apache::thrift::getRequestDeserializationP50()
+            << " p90=" << apache::thrift::getRequestDeserializationP90()
+            << " p99=" << apache::thrift::getRequestDeserializationP99()
+            << " p999=" << apache::thrift::getRequestDeserializationP999();
+}
+
+void printResponseSerializationStats(){
+  LOG(INFO) << "====== Server Response Serialization Stats =======";
+  LOG(INFO) << "Response Serialization (us):"
+            << " avg=" << std::fixed << std::setprecision(2) << apache::thrift::getResponseSerializationAvg()
+            << std::fixed << std::setprecision(0)
+            << " p50=" << apache::thrift::getResponseSerializationP50()
+            << " p90=" << apache::thrift::getResponseSerializationP90()
+            << " p99=" << apache::thrift::getResponseSerializationP99()
+            << " p999=" << apache::thrift::getResponseSerializationP999();
+}
+
+
+void signalHandler(int sig) {
+    if (g_server && !g_stop_requested.exchange(true)) {
+        LOG(INFO) << "==================================";
+        printHeaderCompressionStats();
+        printRocketCompressionStats();
+        printRequestDeserializationStats();
+        printResponseSerializationStats();
+        LOG(INFO) << "==================================";
+        LOG(INFO) << "Received signal " << sig << ", stopping server...";
+        g_server->stop();
+    }
+}
 
 std::unique_ptr<RocketRoutingHandler> createRocketRoutingHandler(
     std::shared_ptr<ThriftServer> server) {
@@ -19,14 +99,17 @@ std::unique_ptr<RocketRoutingHandler> createRocketRoutingHandler(
 }
 
 template <typename ServiceHandler>
-std::shared_ptr<ThriftServer> newServer(int32_t port, int32_t num_threads) {
+std::shared_ptr<ThriftServer> newServer(int32_t port, int32_t num_io_threads, int32_t num_cpu_threads) {
   auto handler = std::make_shared<ServiceHandler>();
   auto server = std::make_shared<ThriftServer>();
+
   server->setPort(port);
   server->setInterface(handler);
-  server->setNumIOWorkerThreads(num_threads);
-  server->setNumCPUWorkerThreads(num_threads);
+  server->setNumIOWorkerThreads(num_io_threads);
+  server->setNumCPUWorkerThreads(num_cpu_threads);
   server->addRoutingHandler(createRocketRoutingHandler(server));
+
+
   return server;
 }
 
@@ -34,12 +117,19 @@ int main(int argc, char** argv) {
   FLAGS_logtostderr = 1;
   folly::init(&argc, &argv);
 
-  press_test::init_resource_collector();
+  util::init_resource_collector();
 
-  auto server = newServer<PerfTestServiceHandler>(FLAGS_port, FLAGS_num_threads);
+  g_server = newServer<PerfTestServiceHandler>(FLAGS_port, FLAGS_num_io_threads, FLAGS_num_cpu_threads);
+
+  signal(SIGINT, signalHandler);
+  signal(SIGTERM, signalHandler);
+
   LOG(INFO) << "PerfTest Server running on port: " << FLAGS_port
-            << " with " << FLAGS_num_threads << " IO threads (Rocket transport)";
-  server->serve();
+            << " with " << FLAGS_num_io_threads << " IO threads and "
+            << FLAGS_num_cpu_threads << " CPU threads (Rocket transport)";
 
+  g_server->serve();
+
+  LOG(INFO) << "Server exited gracefully.";
   return 0;
 }

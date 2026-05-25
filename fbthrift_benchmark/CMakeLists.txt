@@ -46,25 +46,13 @@ target_include_directories(thrift_generated PUBLIC
 add_executable(press_server
     server/PerfTestService.cpp
     server/PressServer.cpp
+    util/ResourceMonitor.cpp
 )
 target_link_libraries(press_server PRIVATE thrift_generated ${COMMON_LIBS} atomic)
 
 
 add_executable(press_client
     client/PressTestClient.cpp
+    util/ResourceMonitor.cpp
 )
 target_link_libraries(press_client PRIVATE thrift_generated ${COMMON_LIBS} atomic)
-
-
-# 测试用的客户端，用于记录延迟
-add_executable(latency_recorder_test
-    test/LatencyRecorderTest.cpp
-)
-target_link_libraries(latency_recorder_test PRIVATE  thrift_generated ${COMMON_LIBS} )
-
-
-
-add_executable(proc_stat_test
-    test/ProcStatTest.cpp
-)
-target_link_libraries(proc_stat_test PRIVATE   atomic)

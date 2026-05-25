@@ -6,9 +6,9 @@ struct Request {
 }
 
 struct PerfTestResponse {
-    1: string cpu_usage;
-    2: binary payload;
-
+    1: double cpu_usage;
+    2: double mem_usage;  
+    3: binary payload;
 }
 
 service PerfTestService {
