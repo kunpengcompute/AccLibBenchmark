@@ -6,7 +6,7 @@
 #include "util/LatencyStats.h"
 
 namespace press_test {
-void init_resource_collector();
+
 class PerfTestServiceHandler
     : virtual public apache::thrift::ServiceHandler<PerfTestService> {
  public:
@@ -15,8 +15,8 @@ class PerfTestServiceHandler
       std::unique_ptr<Request> req) override;
 
  private:
-  std::atomic<uint64_t> last_time_{0};
-  LatencyStats latency_stats_;
+  static std::atomic<uint64_t> g_last_resource_update_time;
+  static constexpr uint64_t CPU_UPDATE_INTERVAL_US = 100000;  // 100ms
 };
 
 } // namespace press_test

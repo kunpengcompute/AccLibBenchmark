@@ -16,48 +16,67 @@
 #include <folly/SocketAddress.h>
 #include <folly/init/Init.h>
 #include <folly/io/async/EventBase.h>
+#include <folly/executors/CPUThreadPoolExecutor.h>
+#include <folly/executors/IOThreadPoolExecutor.h>
+#include <folly/synchronization/Baton.h>
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 #include <thrift/lib/cpp2/async/HeaderClientChannel.h>
 // #include <thrift/lib/cpp2/async/HTTPClientChannel.h>
 #include <thrift/lib/cpp2/async/RocketClientChannel.h>
-
+#include <thrift/lib/cpp2/transport/rocket/PayloadUtils.h>
 #include "gen-cpp2/PerfTestService.h"
 #include "util/LatencyStats.h"
+#include "util/ResourceMonitor.h"
+#include <thrift/lib/cpp2/gen/client_cpp.h>
 
 DEFINE_string(host, "127.0.0.1", "Server host");
 DEFINE_int32(port, 8002, "Server port");
 DEFINE_string(transport, "rocket", "Transport protocol: rocket, header, http2");
-DEFINE_int32(thread_num, 0, "Thread num (0 = scan 1~max_thread_num)");
-DEFINE_int32(max_thread_num, 16, "Max threads for scan mode");
-DEFINE_int32(queue_depth, 1, "In-flight requests per thread");
+DEFINE_int32(queue_depth, 1, "In-flight requests per connection");
 DEFINE_int32(expected_qps, 0, "Expected QPS (0 = unlimited)");
-DEFINE_int32(payload_size, -1, "Payload size (0 = scan 1~1024)");
+DEFINE_int32(payload_size, -1, "Payload size (<0 = scan 1~1024)");
 DEFINE_bool(echo_attachment, false, "Echo payload back");
 DEFINE_int32(rpc_timeout_ms, 2000, "RPC timeout in ms");
 DEFINE_int32(test_seconds, 20, "Test duration");
 DEFINE_int32(test_iterations, 0, "Test iterations (0 = time-based)");
 DEFINE_string(compression, "none", "Compression algorithm: none, zlib, zstd");
+DEFINE_int32(connections, 100, "Total number of connections");
+
+// ============ New: Server-like thread config ============
+DEFINE_int32(io_threads, 10, "Number of IO threads (EventBase count)");
+DEFINE_int32(cpu_threads, 0, "Number of CPU worker threads (0 = use hardware_concurrency)");
 
 using PerfTestClient = apache::thrift::Client<press_test::PerfTestService>;
+static std::atomic<uint64_t> g_client_last_update_time{0};
 
-// ============ 全局状态 ============
+// ============ Global State ============
 
+// Per-CPU-core stats (no lock needed, each callback thread writes to its own)
 struct alignas(64) ThreadStats {
-  LatencyStats latency;
-  uint64_t success{0};
-  uint64_t fail{0};
+    util::HistogramStats<int64_t> latency{100, 0, 5000000};
+    util::HistogramStats<double>   server_cpu_usage{1, 0.0, 30000.0};
+    util::HistogramStats<double>   client_cpu_usage{1, 0.0, 30000.0};
+    util::HistogramStats<double>   server_mem_usage{1, 0.0, 100.0};
+    util::HistogramStats<double>   client_mem_usage{1, 0.0, 100.0};
+
+    std::atomic<uint64_t> success{0};
+    std::atomic<uint64_t> fail{0};
 };
+
+// CPU thread count determines stats array size
+static std::vector<std::unique_ptr<ThreadStats>> g_stats_per_cpu;
 
 std::atomic<bool> g_stop{false};
 std::atomic<uint64_t> g_total_bytes{0};
 std::atomic<uint64_t> g_total_cnt{0};
 
-// 令牌桶限流
+// Token bucket rate limiter
 std::mutex g_token_mtx;
 std::condition_variable g_token_cv;
 int64_t g_token{0};
 
-// ============ 工具函数 ============
+// ============ Utility Functions ============
 
 int64_t monotonic_us() {
   return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -69,7 +88,6 @@ std::string generate_payload(int size) {
     std::string payload;
     payload.resize(size);
 
-    // 使用线程局部随机引擎，避免多线程竞争
     thread_local std::mt19937_64 rng(std::random_device{}());
     std::uniform_int_distribution<int> dist(0, 255);
 
@@ -79,7 +97,7 @@ std::string generate_payload(int size) {
     return payload;
 }
 
-// ============ 令牌桶线程 ============
+// ============ Token Bucket Thread ============
 
 void token_thread(int expected_qps) {
   if (expected_qps <= 0) return;
@@ -106,7 +124,6 @@ void token_thread(int expected_qps) {
   }
 }
 
-
 std::optional<apache::thrift::CompressionConfig> getCompressionConfig(
     const std::string& algo) {
   if (algo == "none" || algo.empty()) {
@@ -126,12 +143,13 @@ std::optional<apache::thrift::CompressionConfig> getCompressionConfig(
   return config;
 }
 
-// ============ 协议工厂 ============
+// ============ Protocol Factory ============
+// Must be called in the EventBase thread
 std::unique_ptr<PerfTestClient> newPerfTestClient(
     folly::EventBase* evb,
     const folly::SocketAddress& addr,
     const std::string& transport) {
-  
+
   auto socket = folly::AsyncSocket::newSocket(evb, addr);
 
   if (transport == "rocket") {
@@ -143,7 +161,7 @@ std::unique_ptr<PerfTestClient> newPerfTestClient(
       channel->setDesiredCompressionConfig(*config);
     }
     return std::make_unique<PerfTestClient>(std::move(channel));
-    
+
   } else if (transport == "header") {
     auto channel = apache::thrift::HeaderClientChannel::newChannel(std::move(socket));
     if (FLAGS_rpc_timeout_ms > 0) {
@@ -153,129 +171,231 @@ std::unique_ptr<PerfTestClient> newPerfTestClient(
       channel->setDesiredCompressionConfig(*config);
     }
     return std::make_unique<PerfTestClient>(std::move(channel));
-    
+
   } else if (transport == "http2") {
     LOG(FATAL) << "http2 transport is not supported yet";
   }
-  
+
   LOG(FATAL) << "Unknown transport: " << transport;
+  return nullptr;
 }
-// ============ 工作线程 ============
 
-void worker_thread(int tid, const folly::SocketAddress& addr,
-                   const std::string& payload, ThreadStats& stats,
-                   folly::EventBase* evb_ptr) {
-  folly::EventBase& evb = *evb_ptr;
+// Get thread-local stats index based on CPU thread pool thread id
+static thread_local int g_stats_idx = -1;
 
-  auto client = newPerfTestClient(&evb, addr, FLAGS_transport);
-
-  press_test::Request request;
-  request.echo_attachment() = FLAGS_echo_attachment;
-  request.payload() = payload;
-
-  std::atomic<int> inflight{0};
-  uint64_t start_time = monotonic_us();
-  uint64_t sent_count = 0;
-
-  std::function<void()> send_request;
-
-  send_request = [&]() {
-    if (g_stop.load(std::memory_order_relaxed)) {
-      if (inflight.load(std::memory_order_relaxed) == 0) {
-        evb.terminateLoopSoon();
-      }
-      return;
+static int get_stats_idx() {
+    if (g_stats_idx < 0) {
+        // First time in this thread, assign an index
+        static std::atomic<int> next_idx{0};
+        g_stats_idx = next_idx.fetch_add(1) % static_cast<int>(g_stats_per_cpu.size());
     }
+    return g_stats_idx;
+}
 
-    if (FLAGS_expected_qps > 0) {
-      std::unique_lock<std::mutex> lock(g_token_mtx);
-      g_token_cv.wait(lock, []() {
-        return g_token > 0 || g_stop.load(std::memory_order_relaxed);
-      });
-      if (g_stop.load(std::memory_order_relaxed)) {
-        if (inflight.load(std::memory_order_relaxed) == 0) {
-          evb.terminateLoopSoon();
-        }
-        return;
-      }
-      g_token--;
-    }
+// ============ Connection Context ============
+struct ConnContext {
+    folly::EventBase* evb;
+    std::unique_ptr<PerfTestClient> client;
+    int evb_idx;
+};
 
-    inflight.fetch_add(1, std::memory_order_relaxed);
-    sent_count++;
+// ============ FIX: 把关键状态包装成 shared_ptr，彻底避免悬空引用 ============
+struct BenchmarkState {
+    std::vector<std::unique_ptr<ConnContext>> ctxs;
+    press_test::Request request;
+    uint64_t start_time{0};
+    std::atomic<int> total_inflight{0};
+    std::atomic<uint64_t> total_processed{0};
+};
 
-    int64_t send_time = monotonic_us();
+// ============ Main thread drives all connections ============
+// 返回 shared_ptr<BenchmarkState>，所有异步回调值捕获该 state，生命周期安全
+std::shared_ptr<BenchmarkState> run_benchmark(
+    const folly::SocketAddress& addr,
+    const std::string& payload,
+    const std::vector<folly::EventBase*>& evb_list,
+    folly::Executor* cpu_executor) {
 
-    client->semifuture_test(request)
-        .via(&evb)
-        .thenTry([&, send_time](folly::Try<press_test::PerfTestResponse>&& t) {
-          int64_t recv_time = monotonic_us();
-          int64_t latency_us = recv_time - send_time;
+    int num_connections = FLAGS_connections;
+    int num_evbs = static_cast<int>(evb_list.size());
 
-          if (t.hasValue()) {
-            stats.latency.addValue(latency_us);
-            stats.success++;
-            g_total_bytes.fetch_add(payload.size(), std::memory_order_relaxed);
-          } else {
-            stats.fail++;
-            LOG(ERROR) << "RPC failed: " << t.exception().what();
-          }
+    auto state = std::make_shared<BenchmarkState>();
 
-          g_total_cnt.fetch_add(1, std::memory_order_relaxed);
-          inflight.fetch_sub(1, std::memory_order_relaxed);
+    for (int i = 0; i < num_connections; ++i) {
+        auto ctx = std::make_unique<ConnContext>();
+        ctx->evb_idx = i % num_evbs;
+        ctx->evb = evb_list[ctx->evb_idx];
 
-          if (!g_stop.load(std::memory_order_relaxed)) {
-            if (FLAGS_test_iterations > 0 && sent_count >= static_cast<uint64_t>(FLAGS_test_iterations)) {
-              g_stop.store(true, std::memory_order_relaxed);
-            } else if (FLAGS_test_iterations == 0 && recv_time - start_time > FLAGS_test_seconds * 1000000LL) {
-              g_stop.store(true, std::memory_order_relaxed);
-            } else {
-              send_request();
-              return;
-            }
-          }
-
-          if (inflight.load(std::memory_order_relaxed) == 0) {
-            evb.terminateLoopSoon();
-          }
+        // Create client in the EventBase thread
+        folly::Baton<> baton;
+        std::unique_ptr<PerfTestClient> client;
+        ctx->evb->runInEventBaseThread([&]() {
+            client = newPerfTestClient(ctx->evb, addr, FLAGS_transport);
+            baton.post();
         });
-  };
+        baton.wait();
+        ctx->client = std::move(client);
 
-  for (int j = 0; j < FLAGS_queue_depth; ++j) {
-    send_request();
-  }
+        state->ctxs.push_back(std::move(ctx));
+    }
 
-  evb.loop();
+    state->request.echo_attachment() = FLAGS_echo_attachment;
+    state->request.payload() = payload;
+    state->start_time = monotonic_us();
+
+    // ========================================================================
+    // FIX: 用 shared_ptr 包装 send_request，值捕获 state，彻底避免悬空
+    // ========================================================================
+    auto send_request = std::make_shared<std::function<void(int)>>();
+
+    // 值捕获 state（shared_ptr）和 send_request（shared_ptr），形成自引用链
+    // 同时值捕获 cpu_executor 指针，保证 .via() 安全
+    *send_request = [state, send_request, cpu_executor](int idx) {
+        auto& ctx = *state->ctxs[idx];
+
+        if (g_stop.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        // QPS rate limiting
+        if (FLAGS_expected_qps > 0) {
+            std::unique_lock<std::mutex> lock(g_token_mtx);
+            if (g_token <= 0) {
+                lock.unlock();
+                // 从 CPU 线程安全地回到 EventBase 线程再调 runAfterDelay
+                ctx.evb->runInEventBaseThread([idx, send_request, evb = ctx.evb]() {
+                    evb->runAfterDelay([idx, send_request]() {
+                        (*send_request)(idx);
+                    }, 1);  // 1ms 延迟，更灵敏
+                });
+                return;
+            }
+            g_token--;
+        }
+
+        if (g_stop.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        state->total_inflight.fetch_add(1, std::memory_order_relaxed);
+        int64_t send_time = monotonic_us();
+
+        ctx.client->semifuture_test(state->request)
+            .via(cpu_executor)
+            .thenTry([state, idx, send_time, send_request](folly::Try<press_test::PerfTestResponse>&& t) {
+                int64_t recv_time = monotonic_us();
+                int64_t latency_us = recv_time - send_time;
+
+                int stats_idx = get_stats_idx();
+                ThreadStats& stats = *g_stats_per_cpu[stats_idx];
+
+                if (t.hasValue()) {
+                    stats.latency.addValue(latency_us);
+                    stats.success.fetch_add(1, std::memory_order_relaxed);
+                    if (t.value().cpu_usage().value() > 0) {
+                        stats.server_cpu_usage.addValue(t.value().cpu_usage().value());
+                    }
+                    if (t.value().mem_usage().value() > 0) {
+                        stats.server_mem_usage.addValue(t.value().mem_usage().value());
+                    }
+                    g_total_bytes.fetch_add(state->request.payload()->size(), std::memory_order_relaxed);
+                } else {
+                    stats.fail.fetch_add(1, std::memory_order_relaxed);
+                    LOG(ERROR) << "RPC failed: " << t.exception().what();
+                }
+
+                uint64_t last = g_client_last_update_time.load(std::memory_order_relaxed);
+                if (recv_time > last && recv_time - last > 100000) {
+                    if (g_client_last_update_time.compare_exchange_weak(
+                            last, recv_time, std::memory_order_relaxed)) {
+                        auto snap = util::g_snapshot.load(std::memory_order_acquire);
+                        stats.client_cpu_usage.addValue(snap.cpu_percent);
+                        stats.client_mem_usage.addValue(snap.mem_percent);
+                    }
+                }
+
+                g_total_cnt.fetch_add(1, std::memory_order_relaxed);
+                state->total_inflight.fetch_sub(1, std::memory_order_relaxed);
+                auto processed = state->total_processed.fetch_add(1, std::memory_order_relaxed) + 1;
+
+                if (!g_stop.load(std::memory_order_acquire)) {
+                    if (FLAGS_test_iterations > 0 &&
+                        processed >= static_cast<uint64_t>(FLAGS_test_iterations)) {
+                        g_stop.store(true, std::memory_order_release);
+                    } else if (FLAGS_test_iterations == 0 &&
+                               recv_time - state->start_time > FLAGS_test_seconds * 1000000LL) {
+                        g_stop.store(true, std::memory_order_release);
+                    } else {
+                        (*send_request)(idx);  // 通过 shared_ptr 调用
+                    }
+                }
+            });
+    };
+
+    // Initialize: distribute queue_depth across all connections
+    for (int i = 0; i < num_connections; ++i) {
+        for (int j = 0; j < FLAGS_queue_depth; ++j) {
+            state->ctxs[i]->evb->runInEventBaseThread([i, send_request]() {
+                (*send_request)(i);
+            });
+        }
+    }
+
+    // Main thread waits for completion (all responses received)
+    while (!g_stop.load(std::memory_order_acquire) ||
+           state->total_inflight.load(std::memory_order_acquire) > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    return state;
 }
 
-// ============ 单次测试 ============
+// ============ Single Test Run ============
 
-void test_once(int thread_num, int payload_size) {
+void test_once(int payload_size) {
   std::string payload = generate_payload(payload_size);
 
-  std::cout << "[Threads: " << thread_num
+  int io_thread_num = FLAGS_io_threads > 0 ? FLAGS_io_threads : 10;
+  int cpu_thread_num = FLAGS_cpu_threads > 0 ? FLAGS_cpu_threads : static_cast<int>(std::thread::hardware_concurrency());
+
+  LOG(INFO) << "[IOThreads: " << io_thread_num
+            << ", CPUThreads: " << cpu_thread_num
+            << ", Connections: " << FLAGS_connections
             << ", Depth: " << FLAGS_queue_depth
             << ", Payload: " << payload_size << "B"
             << ", Transport: " << FLAGS_transport
             << ", QPS: " << (FLAGS_expected_qps > 0 ? std::to_string(FLAGS_expected_qps) : "unlimited")
             << ", Duration: " << FLAGS_test_seconds << "s"
             << ", Echo: " << (FLAGS_echo_attachment ? "yes" : "no")
-            << "]" << std::endl;
+            << "]" ;
 
-  g_stop.store(false, std::memory_order_relaxed);
+  g_stop.store(false, std::memory_order_release);
   g_total_bytes.store(0, std::memory_order_relaxed);
   g_total_cnt.store(0, std::memory_order_relaxed);
 
   {
     std::lock_guard<std::mutex> lock(g_token_mtx);
-    g_token = (FLAGS_expected_qps > 0) ? 10000 : 0;
+    g_token = (FLAGS_expected_qps > 0) ? FLAGS_expected_qps : 0;
   }
 
-  std::vector<ThreadStats> stats(thread_num);
-  std::vector<folly::EventBase*> evbs(thread_num, nullptr);
-  std::vector<std::thread> workers;
+  // Initialize per-CPU stats
+  g_stats_per_cpu.clear();
+  for (int i = 0; i < cpu_thread_num; ++i) {
+      g_stats_per_cpu.push_back(std::make_unique<ThreadStats>());
+  }
+
+  std::vector<folly::EventBase*> evbs;
 
   folly::SocketAddress addr(FLAGS_host, FLAGS_port);
+
+  // Create IO thread pool
+  auto io_executor = std::make_shared<folly::IOThreadPoolExecutor>(io_thread_num);
+  for (int i = 0; i < io_thread_num; ++i) {
+      evbs.push_back(io_executor->getEventBase());
+  }
+
+  // Create CPU thread pool
+  auto cpu_executor = std::make_shared<folly::CPUThreadPoolExecutor>(cpu_thread_num);
 
   std::thread token_td;
   if (FLAGS_expected_qps > 0) {
@@ -284,21 +404,81 @@ void test_once(int thread_num, int payload_size) {
 
   auto test_start = std::chrono::steady_clock::now();
 
-  for (int i = 0; i < thread_num; ++i) {
-    evbs[i] = new folly::EventBase();
-    workers.emplace_back(worker_thread, i, std::ref(addr),
-                         std::ref(payload), std::ref(stats[i]), evbs[i]);
-  }
+  // Main thread runs benchmark, gets state back (all async data safely inside)
+  auto state = run_benchmark(addr, payload, evbs, cpu_executor.get());
 
-  for (auto& t : workers) {
-    t.join();
-  }
+  //  header compress Stats
+  auto header_compress_avg = apache::thrift::transport::getHeaderCompressionAvg();
+  auto header_compress_p50 = apache::thrift::transport::getHeaderCompressionP50();
+  auto header_compress_p90 = apache::thrift::transport::getHeaderCompressionP90();
+  auto header_compress_p99 = apache::thrift::transport::getHeaderCompressionP99();
+  auto header_compress_p999 = apache::thrift::transport::getHeaderCompressionP999();
 
-  g_stop.store(true, std::memory_order_relaxed);
+  //  header decompress Stats
+  auto header_decompress_avg = apache::thrift::transport::getHeaderDecompressionAvg();
+  auto header_decompress_p50 = apache::thrift::transport::getHeaderDecompressionP50();
+  auto header_decompress_p90 = apache::thrift::transport::getHeaderDecompressionP90();
+  auto header_decompress_p99 = apache::thrift::transport::getHeaderDecompressionP99();
+  auto header_decompress_p999 = apache::thrift::transport::getHeaderDecompressionP999();
+
+  //Rocket Compression Stats
+  auto rocket_compress_avg = apache::thrift::rocket::getRocketCompressionAvg();
+  auto rocket_compress_p50 = apache::thrift::rocket::getRocketCompressionP50();
+  auto rocket_compress_p90 = apache::thrift::rocket::getRocketCompressionP90();
+  auto rocket_compress_p99 = apache::thrift::rocket::getRocketCompressionP99();
+  auto rocket_compress_p999 = apache::thrift::rocket::getRocketCompressionP999();
+
+  //Rocket Decompression Stats
+  auto rocket_decompress_avg = apache::thrift::rocket::getRocketDecompressionAvg();
+  auto rocket_decompress_p50 = apache::thrift::rocket::getRocketDecompressionP50();
+  auto rocket_decompress_p90 = apache::thrift::rocket::getRocketDecompressionP90();
+  auto rocket_decompress_p99 = apache::thrift::rocket::getRocketDecompressionP99();
+  auto rocket_decompress_p999 = apache::thrift::rocket::getRocketDecompressionP999();
+
+  //  request serialize Stats
+  auto request_serialize_avg = apache::thrift::getRequestSerializationAvg();
+  auto request_serialize_p50 = apache::thrift::getRequestSerializationP50();
+  auto request_serialize_p90 = apache::thrift::getRequestSerializationP90();
+  auto request_serialize_p99 = apache::thrift::getRequestSerializationP99();
+  auto request_serialize_p999 = apache::thrift::getRequestSerializationP999();
+
+  //  response deserialize Stats
+  auto response_deserialize_avg = apache::thrift::getResponseDeserializationAvg();
+  auto response_deserialize_p50 = apache::thrift::getResponseDeserializationP50();
+  auto response_deserialize_p90 = apache::thrift::getResponseDeserializationP90();
+  auto response_deserialize_p99 = apache::thrift::getResponseDeserializationP99();
+  auto response_deserialize_p999 = apache::thrift::getResponseDeserializationP999();
+
+  // Signal stop to token thread
+  g_stop.store(true, std::memory_order_release);
   g_token_cv.notify_all();
   if (token_td.joinable()) {
     token_td.join();
   }
+
+  // CRITICAL: Wait for all callbacks to finish before destroying clients
+  cpu_executor->stop();
+  cpu_executor->join();
+
+  // Now safe to destroy clients (no callbacks running)
+  for (auto& ctx : state->ctxs) {
+      folly::Baton<> baton;
+      auto* evb = ctx->evb;
+      auto client_ptr = ctx->client.release();
+      evb->runInEventBaseThread([client_ptr, &baton]() {
+          delete client_ptr;
+          baton.post();
+      });
+      baton.wait();
+  }
+  state->ctxs.clear();
+
+  // Clear EventBase references before stopping IO threads
+  evbs.clear();
+
+  // Stop IO thread pool last
+  io_executor->stop();
+  io_executor->join();
 
   auto test_end = std::chrono::steady_clock::now();
   auto elapsed_ms =
@@ -306,15 +486,24 @@ void test_once(int thread_num, int payload_size) {
           .count();
   double elapsed_sec = elapsed_ms / 1000.0;
 
-  LatencyStats total_latency;
+  // Aggregate stats from all CPU threads (no locks needed during aggregation)
+  util::HistogramStats<int64_t> total_latency(100, 0, 5000000);
+  util::HistogramStats<double> total_server_cpu(1, 0.0, 30000.0);
+  util::HistogramStats<double> total_client_cpu(1, 0.0, 30000.0);
+  util::HistogramStats<double> total_server_mem(1, 0.0, 100.0);
+  util::HistogramStats<double> total_client_mem(1, 0.0, 100.0);
   uint64_t total_success = 0;
   uint64_t total_fail = 0;
 
-  for (int i = 0; i < thread_num; ++i) {
-    total_latency.merge(stats[i].latency);
-    total_success += stats[i].success;
-    total_fail += stats[i].fail;
-    delete evbs[i];
+  for (auto& stats_ptr : g_stats_per_cpu) {
+      ThreadStats& stats = *stats_ptr;
+      total_latency.merge(stats.latency);
+      total_server_cpu.merge(stats.server_cpu_usage);
+      total_client_cpu.merge(stats.client_cpu_usage);
+      total_server_mem.merge(stats.server_mem_usage);
+      total_client_mem.merge(stats.client_mem_usage);
+      total_success += stats.success.load();
+      total_fail += stats.fail.load();
   }
 
   uint64_t total_cnt = total_success + total_fail;
@@ -340,9 +529,98 @@ void test_once(int thread_num, int payload_size) {
               << " p90=" << total_latency.getPercentile(0.90)
               << " p99=" << total_latency.getPercentile(0.99)
               << " p999=" << total_latency.getPercentile(0.999);
+
+    LOG(INFO) << "Server CPU (%):"
+              << " avg=" << std::fixed << std::setprecision(2) << total_server_cpu.getAvg()
+              << " min=" << total_server_cpu.getMin()
+              << " max=" << total_server_cpu.getMax()
+              << " p50=" << total_server_cpu.getPercentile(0.50)
+              << " p90=" << total_server_cpu.getPercentile(0.90)
+              << " p99=" << total_server_cpu.getPercentile(0.99)
+              << " p999=" << total_server_cpu.getPercentile(0.999);
+
+    LOG(INFO) << "Client CPU (%):"
+              << " avg=" << std::fixed << std::setprecision(2) << total_client_cpu.getAvg()
+              << " min=" << total_client_cpu.getMin()
+              << " max=" << total_client_cpu.getMax()
+              << " p50=" << total_client_cpu.getPercentile(0.50)
+              << " p90=" << total_client_cpu.getPercentile(0.90)
+              << " p99=" << total_client_cpu.getPercentile(0.99)
+              << " p999=" << total_client_cpu.getPercentile(0.999);
+
+    LOG(INFO) << "Server Memory (%):"
+              << " avg=" << std::fixed << std::setprecision(2) << total_server_mem.getAvg()
+              << " min=" << total_server_mem.getMin()
+              << " max=" << total_server_mem.getMax()
+              << " p50=" << total_server_mem.getPercentile(0.50)
+              << " p90=" << total_server_mem.getPercentile(0.90)
+              << " p99=" << total_server_mem.getPercentile(0.99)
+              << " p999=" << total_server_mem.getPercentile(0.999);
+
+    LOG(INFO) << "Client Memory (%):"
+              << " avg=" << std::fixed << std::setprecision(2) << total_client_mem.getAvg()
+              << " min=" << total_client_mem.getMin()
+              << " max=" << total_client_mem.getMax()
+              << " p50=" << total_client_mem.getPercentile(0.50)
+              << " p90=" << total_client_mem.getPercentile(0.90)
+              << " p99=" << total_client_mem.getPercentile(0.99)
+              << " p999=" << total_client_mem.getPercentile(0.999);
   }
 
-  LOG(INFO) << "================================";
+  if (FLAGS_compression != "none" && FLAGS_transport == "header") {
+      LOG(INFO) << "Header Compression (us):"
+                << " avg=" << std::fixed << std::setprecision(2) << header_compress_avg
+                << std::fixed << std::setprecision(0)
+                << " p50=" << header_compress_p50
+                << " p90=" << header_compress_p90
+                << " p99=" << header_compress_p99
+                << " p999=" << header_compress_p999;
+
+      LOG(INFO) << "Header Decompression (us):"
+                << " avg=" << std::fixed << std::setprecision(2) << header_decompress_avg
+                << std::fixed << std::setprecision(0)
+                << " p50=" << header_decompress_p50
+                << " p90=" << header_decompress_p90
+                << " p99=" << header_decompress_p99
+                << " p999=" << header_decompress_p999;
+  }
+
+  if (FLAGS_compression != "none" && FLAGS_transport == "rocket") {
+      LOG(INFO) << "Rocket Compression (us):"
+                << " avg=" << std::fixed << std::setprecision(2) << rocket_compress_avg
+                << std::fixed << std::setprecision(0)
+                << " p50=" << rocket_compress_p50
+                << " p90=" << rocket_compress_p90
+                << " p99=" << rocket_compress_p99
+                << " p999=" << rocket_compress_p999;
+
+      LOG(INFO) << "Rocket Decompression (us):"
+                << " avg=" << std::fixed << std::setprecision(2) << rocket_decompress_avg
+                << std::fixed << std::setprecision(0)
+                << " p50=" << rocket_decompress_p50
+                << " p90=" << rocket_decompress_p90
+                << " p99=" << rocket_decompress_p99
+                << " p999=" << rocket_decompress_p999;
+  }
+
+  LOG(INFO) << "Request Serialization (us) :"
+            << " avg=" << std::fixed << std::setprecision(2) << request_serialize_avg
+            << std::fixed << std::setprecision(0)
+            << " p50=" << request_serialize_p50
+            << " p90=" << request_serialize_p90
+            << " p99=" << request_serialize_p99
+            << " p999=" << request_serialize_p999;
+
+  LOG(INFO) << "Response Deserialization (us) :"
+            << " avg=" << std::fixed << std::setprecision(2) << response_deserialize_avg
+            << std::fixed << std::setprecision(0)
+            << " p50=" << response_deserialize_p50
+            << " p90=" << response_deserialize_p90
+            << " p99=" << response_deserialize_p99
+            << " p999=" << response_deserialize_p999;
+
+  LOG(INFO) << "================================"; 
+
 }
 
 // ============ main ============
@@ -350,22 +628,13 @@ void test_once(int thread_num, int payload_size) {
 int main(int argc, char* argv[]) {
   FLAGS_logtostderr = true;
   const folly::Init init(&argc, &argv);
+  util::init_resource_collector();
 
-  if (FLAGS_thread_num > 0 && FLAGS_payload_size >= 0) {
-    test_once(FLAGS_thread_num, FLAGS_payload_size);
-  } else if (FLAGS_thread_num <= 0 && FLAGS_payload_size >= 0) {
-    for (int i = 1; i <= FLAGS_max_thread_num; i *= 2) {
-      test_once(i, FLAGS_payload_size);
-    }
-  } else if (FLAGS_thread_num > 0 && FLAGS_payload_size < 0) {
-    for (int i = 1; i <= 1024; i *= 4) {
-      test_once(FLAGS_thread_num, i);
-    }
+  if (FLAGS_payload_size >= 0) {
+    test_once(FLAGS_payload_size);
   } else {
-    for (int j = 1; j <= 1024; j *= 4) {
-      for (int i = 1; i <= FLAGS_max_thread_num; i *= 2) {
-        test_once(i, j);
-      }
+    for (int i = 1; i <= 1024; i *= 4) {
+      test_once(i);
     }
   }
 

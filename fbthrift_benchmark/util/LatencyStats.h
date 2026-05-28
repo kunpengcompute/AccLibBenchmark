@@ -1,82 +1,87 @@
-// latency_stats.h
 #pragma once
 
 #include <cstdint>
+#include <algorithm>
+#include <limits>
 #include <folly/stats/Histogram.h>
 
-class LatencyStats {
-public:
-    // 构造：桶宽(us)，最小值，最大值。例如 1000us=1ms 一个桶，范围 0~100000us (100ms)
-    LatencyStats(int64_t bucketSize = 1000, int64_t min = 0, int64_t max = 100000)
-        : hist_(bucketSize, min, max), sum_(0), count_(0), min_(0), max_(0) {}
+namespace util {
 
-    // 记录一个延迟值（微秒）
-    void addValue(int64_t latency_us) {
-        hist_.addValue(latency_us);
-        sum_ += latency_us;
-        count_++;
+template <typename T>
+class HistogramStats {
+public:
+    explicit HistogramStats(T bucketSize, T min, T max)
+        : hist_(bucketSize, min, max), sum_(0), count_(0),
+          actual_min_(std::numeric_limits<T>::max()),
+          actual_max_(std::numeric_limits<T>::lowest()) {}
+
+    void addValue(T val) {
+        hist_.addValue(val);
+        sum_ += val;
+        ++count_;
         if (count_ == 1) {
-            min_ = latency_us;
-            max_ = latency_us;
+            actual_min_ = val;
+            actual_max_ = val;
         } else {
-            if (latency_us < min_) min_ = latency_us;
-            if (latency_us > max_) max_ = latency_us;
+            actual_min_ = std::min(actual_min_, val);
+            actual_max_ = std::max(actual_max_, val);
         }
     }
 
-    // 合并另一个 LatencyStats 对象
-    void merge(const LatencyStats& other) {
+    void merge(const HistogramStats& other) {
         if (other.count_ == 0) return;
         hist_.merge(other.hist_);
         sum_ += other.sum_;
         count_ += other.count_;
-        if (count_ == other.count_) { // 当前为空，则直接取对方
-            min_ = other.min_;
-            max_ = other.max_;
-        } else {
-            if (other.min_ < min_) min_ = other.min_;
-            if (other.max_ > max_) max_ = other.max_;
+        if (other.count_ > 0) {
+            if (count_ == other.count_) {
+                // 合并前自身为空，直接继承对方的 min/max
+                actual_min_ = other.actual_min_;
+                actual_max_ = other.actual_max_;
+            } else {
+                actual_min_ = std::min(actual_min_, other.actual_min_);
+                actual_max_ = std::max(actual_max_, other.actual_max_);
+            }
         }
     }
 
-    // 获取总样本数
     uint64_t getCount() const { return count_; }
+    T getSum() const { return sum_; }
 
-    // 获取总延迟和
-    int64_t getSum() const { return sum_; }
-
-    // 获取平均延迟（微秒）
     double getAvg() const {
-        return count_ ? static_cast<double>(sum_) / count_ : 0.0;
+        return count_ ? static_cast<double>(sum_) / static_cast<double>(count_) : 0.0;
     }
 
-    // 获取最小值
-    int64_t getMin() const { return min_; }
+    // 返回实际数据中的最小值，无数据时返回 0
+    T getMin() const {
+        return count_ ? actual_min_ : T{};
+    }
 
-    // 获取最大值
-    int64_t getMax() const { return max_; }
+    // 返回实际数据中的最大值，无数据时返回 0
+    T getMax() const {
+        return count_ ? actual_max_ : T{};
+    }
 
-    // 获取百分位数（例如 p=0.99 表示 P99）
-    int64_t getPercentile(double p) const {
-        if (count_ == 0) return 0;
-        if (p < 0.0) p = 0.0;
-        if (p > 1.0) p = 1.0;
+    T getPercentile(double p) const {
+        if (count_ == 0) return T{};
+        p = std::max(0.0, std::min(1.0, p));
         return hist_.getPercentileEstimate(p);
     }
 
-    // 清空所有统计
     void clear() {
         hist_.clear();
         sum_ = 0;
         count_ = 0;
-        min_ = 0;
-        max_ = 0;
+        actual_min_ = std::numeric_limits<T>::max();
+        actual_max_ = std::numeric_limits<T>::lowest();
     }
 
 private:
-    folly::Histogram<int64_t> hist_;
-    int64_t sum_;
+    folly::Histogram<T> hist_;
+    T sum_;
     uint64_t count_;
-    int64_t min_;
-    int64_t max_;
+    T actual_min_;
+    T actual_max_;
 };
+
+} // namespace util
