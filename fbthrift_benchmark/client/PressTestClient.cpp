@@ -52,7 +52,7 @@ DEFINE_int32(io_threads, 10, "Number of IO threads (EventBase count)");
 DEFINE_int32(cpu_threads, 0, "Number of CPU worker threads (0 = use hardware_concurrency)");
 
 using PerfTestClient = apache::thrift::Client<press_test::PerfTestService>;
-using UniversalClient = apache::thrift::Client<example::universal::UniversalService>;
+using UniversalClient = apache::thrift::Client<universal::UniversalService>;
 static std::atomic<uint64_t> g_client_last_update_time{0};
 
 // ============ Global State ============
@@ -239,7 +239,7 @@ struct SerializationHandler {
   virtual ~SerializationHandler() = default;
   virtual std::string serialize(const std::string& payload, bool echo_attachment) = 0;
   virtual void processResponse(const std::string& payload, ThreadStats& stats) = 0;
-  virtual example::universal::SerializationType getType() const = 0;
+  virtual universal::SerializationType getType() const = 0;
 };
 
 struct ProtobufHandler : SerializationHandler {
@@ -263,8 +263,8 @@ struct ProtobufHandler : SerializationHandler {
     }
   }
 
-  example::universal::SerializationType getType() const override {
-    return example::universal::SerializationType::PROTOBUF;
+  universal::SerializationType getType() const override {
+    return universal::SerializationType::PROTOBUF;
   }
 };
 
@@ -278,9 +278,9 @@ struct SimdJsonHandler : SerializationHandler {
     LOG(FATAL) << "SimdJson deserialization not implemented yet";
   }
 
-  example::universal::SerializationType getType() const override {
+  universal::SerializationType getType() const override {
     LOG(FATAL) << "SimdJson serialization type not defined";
-    return example::universal::SerializationType::SIMD_JSON;
+    return universal::SerializationType::SIMD_JSON;
   }
 };
 
@@ -322,215 +322,215 @@ std::shared_ptr<BenchmarkState> run_benchmark(
     const std::vector<folly::EventBase*>& evb_list,
     folly::Executor* cpu_executor) {
 
-    int num_connections = FLAGS_connections;
-    int num_evbs = static_cast<int>(evb_list.size());
-    bool is_native_mode = (FLAGS_mode == "native");
-    auto protocolId = getProtocolId(FLAGS_thrift_serialization);
+  int num_connections = FLAGS_connections;
+  int num_evbs = static_cast<int>(evb_list.size());
+  bool is_native_mode = (FLAGS_mode == "native");
+  auto protocolId = getProtocolId(FLAGS_thrift_serialization);
 
-    if (!is_native_mode && FLAGS_universal_serialization == "none") {
-      LOG(FATAL) << "universal_serialization must be set when mode is universal";
+  if (!is_native_mode && FLAGS_universal_serialization == "none") {
+    LOG(FATAL) << "universal_serialization must be set when mode is universal";
+  }
+
+  auto state = std::make_shared<BenchmarkState>();
+  state->is_native_mode = is_native_mode;
+
+  if (!is_native_mode) {
+    state->serialization_handler = createSerializationHandler(FLAGS_universal_serialization);
+  }
+
+  for (int i = 0; i < num_connections; ++i) {
+    auto ctx = std::make_unique<ConnContext>();
+    ctx->evb_idx = i % num_evbs;
+    ctx->evb = evb_list[ctx->evb_idx];
+
+    // Create client in the EventBase thread
+    if (is_native_mode) {
+      folly::Baton<> baton;
+      std::unique_ptr<PerfTestClient> client;
+      ctx->evb->runInEventBaseThread([&]() {
+        client = newPerfTestClient(ctx->evb, addr, FLAGS_transport, protocolId);
+        baton.post();
+      });
+      baton.wait();
+      ctx->client = std::move(client);
+    } else {
+      folly::Baton<> baton;
+      std::unique_ptr<UniversalClient> uclient;
+      ctx->evb->runInEventBaseThread([&]() {
+        uclient = newUniversalClient(ctx->evb, addr, FLAGS_transport, protocolId);
+        baton.post();
+      });
+      baton.wait();
+      ctx->universal_client = std::move(uclient);
     }
 
-    auto state = std::make_shared<BenchmarkState>();
-    state->is_native_mode = is_native_mode;
+    state->ctxs.push_back(std::move(ctx));
+  }
 
-    if (!is_native_mode) {
-      state->serialization_handler = createSerializationHandler(FLAGS_universal_serialization);
+  state->request.echo_attachment() = FLAGS_echo_attachment;
+  state->request.payload() = payload;
+  state->start_time = monotonic_us();
+
+  if (!is_native_mode && state->serialization_handler) {
+    state->serialized_payload = state->serialization_handler->serialize(payload, FLAGS_echo_attachment);
+  }
+
+  // ========================================================================
+  // FIX: 用 shared_ptr 包装 send_request，值捕获 state，彻底避免悬空
+  // ========================================================================
+  auto send_request = std::make_shared<std::function<void(int)>>();
+
+  // 值捕获 state（shared_ptr）和 send_request（shared_ptr），形成自引用链
+  // 同时值捕获 cpu_executor 指针，保证 .via() 安全
+  *send_request = [state, send_request, cpu_executor](int idx) {
+    auto& ctx = *state->ctxs[idx];
+
+    if (g_stop.load(std::memory_order_acquire)) {
+      return;
     }
 
-    for (int i = 0; i < num_connections; ++i) {
-        auto ctx = std::make_unique<ConnContext>();
-        ctx->evb_idx = i % num_evbs;
-        ctx->evb = evb_list[ctx->evb_idx];
-
-        // Create client in the EventBase thread
-        if (is_native_mode) {
-            folly::Baton<> baton;
-            std::unique_ptr<PerfTestClient> client;
-            ctx->evb->runInEventBaseThread([&]() {
-                client = newPerfTestClient(ctx->evb, addr, FLAGS_transport, protocolId);
-                baton.post();
-            });
-            baton.wait();
-            ctx->client = std::move(client);
-        } else {
-            folly::Baton<> baton;
-            std::unique_ptr<UniversalClient> uclient;
-            ctx->evb->runInEventBaseThread([&]() {
-                uclient = newUniversalClient(ctx->evb, addr, FLAGS_transport, protocolId);
-                baton.post();
-            });
-            baton.wait();
-            ctx->universal_client = std::move(uclient);
-        }
-
-        state->ctxs.push_back(std::move(ctx));
+    // QPS rate limiting
+    if (FLAGS_expected_qps > 0) {
+      std::unique_lock<std::mutex> lock(g_token_mtx);
+      if (g_token <= 0) {
+        lock.unlock();
+        // 从 CPU 线程安全地回到 EventBase 线程再调 runAfterDelay
+        ctx.evb->runInEventBaseThread([idx, send_request, evb = ctx.evb]() {
+          evb->runAfterDelay([idx, send_request]() {
+            (*send_request)(idx);
+          }, 1);  // 1ms 延迟，更灵敏
+        });
+        return;
+      }
+      g_token--;
     }
 
-    state->request.echo_attachment() = FLAGS_echo_attachment;
-    state->request.payload() = payload;
-    state->start_time = monotonic_us();
-
-    if (!is_native_mode && state->serialization_handler) {
-      state->serialized_payload = state->serialization_handler->serialize(payload, FLAGS_echo_attachment);
+    if (g_stop.load(std::memory_order_acquire)) {
+      return;
     }
 
-    // ========================================================================
-    // FIX: 用 shared_ptr 包装 send_request，值捕获 state，彻底避免悬空
-    // ========================================================================
-    auto send_request = std::make_shared<std::function<void(int)>>();
+    state->total_inflight.fetch_add(1, std::memory_order_relaxed);
+    int64_t send_time = monotonic_us();
 
-    // 值捕获 state（shared_ptr）和 send_request（shared_ptr），形成自引用链
-    // 同时值捕获 cpu_executor 指针，保证 .via() 安全
-    *send_request = [state, send_request, cpu_executor](int idx) {
-        auto& ctx = *state->ctxs[idx];
+    if (state->is_native_mode) {
+      ctx.client->semifuture_test(state->request)
+          .via(cpu_executor)
+          .thenTry([state, idx, send_time, send_request](folly::Try<press_test::PerfTestResponse>&& t) {
+            int64_t recv_time = monotonic_us();
+            int64_t latency_us = recv_time - send_time;
 
-        if (g_stop.load(std::memory_order_acquire)) {
-            return;
-        }
+            int stats_idx = get_stats_idx();
+            ThreadStats& stats = *g_stats_per_cpu[stats_idx];
 
-        // QPS rate limiting
-        if (FLAGS_expected_qps > 0) {
-            std::unique_lock<std::mutex> lock(g_token_mtx);
-            if (g_token <= 0) {
-                lock.unlock();
-                // 从 CPU 线程安全地回到 EventBase 线程再调 runAfterDelay
-                ctx.evb->runInEventBaseThread([idx, send_request, evb = ctx.evb]() {
-                    evb->runAfterDelay([idx, send_request]() {
-                        (*send_request)(idx);
-                    }, 1);  // 1ms 延迟，更灵敏
-                });
-                return;
+            if (t.hasValue()) {
+              stats.latency.addValue(latency_us);
+              stats.success.fetch_add(1, std::memory_order_relaxed);
+              if (t.value().cpu_usage().value() > 0) {
+                stats.server_cpu_usage.addValue(t.value().cpu_usage().value());
+              }
+              if (t.value().mem_usage().value() > 0) {
+                stats.server_mem_usage.addValue(t.value().mem_usage().value());
+              }
+              g_total_bytes.fetch_add(state->request.payload()->size(), std::memory_order_relaxed);
+            } else {
+              stats.fail.fetch_add(1, std::memory_order_relaxed);
+              LOG(ERROR) << "RPC failed: " << t.exception().what();
             }
-            g_token--;
-        }
 
-        if (g_stop.load(std::memory_order_acquire)) {
-            return;
-        }
+            uint64_t last = g_client_last_update_time.load(std::memory_order_relaxed);
+            if (recv_time > last && recv_time - last > 100000) {
+              if (g_client_last_update_time.compare_exchange_weak(
+                      last, recv_time, std::memory_order_relaxed)) {
+                auto snap = util::g_snapshot.load(std::memory_order_acquire);
+                stats.client_cpu_usage.addValue(snap.cpu_percent);
+                stats.client_mem_usage.addValue(snap.mem_percent);
+              }
+            }
 
-        state->total_inflight.fetch_add(1, std::memory_order_relaxed);
-        int64_t send_time = monotonic_us();
+            g_total_cnt.fetch_add(1, std::memory_order_relaxed);
+            state->total_inflight.fetch_sub(1, std::memory_order_relaxed);
+            auto processed = state->total_processed.fetch_add(1, std::memory_order_relaxed) + 1;
 
-        if (state->is_native_mode) {
-            ctx.client->semifuture_test(state->request)
-                .via(cpu_executor)
-                .thenTry([state, idx, send_time, send_request](folly::Try<press_test::PerfTestResponse>&& t) {
-                int64_t recv_time = monotonic_us();
-                int64_t latency_us = recv_time - send_time;
+            if (!g_stop.load(std::memory_order_acquire)) {
+              if (FLAGS_test_iterations > 0 &&
+                  processed >= static_cast<uint64_t>(FLAGS_test_iterations)) {
+                g_stop.store(true, std::memory_order_release);
+              } else if (FLAGS_test_iterations == 0 &&
+                          recv_time - state->start_time > FLAGS_test_seconds * 1000000LL) {
+                g_stop.store(true, std::memory_order_release);
+              } else {
+                (*send_request)(idx); // 通过 shared_ptr 调用
+              }
+            }
+          });
+    } else {
+      universal::UniversalRequest univ_req;
+      univ_req.type() = state->serialization_handler->getType();
+      *univ_req.payload() = state->serialized_payload;
 
-                int stats_idx = get_stats_idx();
-                ThreadStats& stats = *g_stats_per_cpu[stats_idx];
+      ctx.universal_client->semifuture_test(univ_req)
+          .via(cpu_executor)
+          .thenTry([state, idx, send_time, send_request](folly::Try<universal::UniversalResponse>&& t) {
+            int64_t recv_time = monotonic_us();
+            int64_t latency_us = recv_time - send_time;
 
-                if (t.hasValue()) {
-                    stats.latency.addValue(latency_us);
-                    stats.success.fetch_add(1, std::memory_order_relaxed);
-                    if (t.value().cpu_usage().value() > 0) {
-                        stats.server_cpu_usage.addValue(t.value().cpu_usage().value());
-                    }
-                    if (t.value().mem_usage().value() > 0) {
-                        stats.server_mem_usage.addValue(t.value().mem_usage().value());
-                    }
-                    g_total_bytes.fetch_add(state->request.payload()->size(), std::memory_order_relaxed);
-                } else {
-                    stats.fail.fetch_add(1, std::memory_order_relaxed);
-                    LOG(ERROR) << "RPC failed: " << t.exception().what();
-                }
+            int stats_idx = get_stats_idx();
+            ThreadStats& stats = *g_stats_per_cpu[stats_idx];
 
-                uint64_t last = g_client_last_update_time.load(std::memory_order_relaxed);
-                if (recv_time > last && recv_time - last > 100000) {
-                    if (g_client_last_update_time.compare_exchange_weak(
-                            last, recv_time, std::memory_order_relaxed)) {
-                        auto snap = util::g_snapshot.load(std::memory_order_acquire);
-                        stats.client_cpu_usage.addValue(snap.cpu_percent);
-                        stats.client_mem_usage.addValue(snap.mem_percent);
-                    }
-                }
+            if (t.hasValue()) {
+              stats.latency.addValue(latency_us);
+              stats.success.fetch_add(1, std::memory_order_relaxed);
+              state->serialization_handler->processResponse(*t.value().payload(), stats);
+            } else {
+              stats.fail.fetch_add(1, std::memory_order_relaxed);
+              LOG(ERROR) << "RPC failed: " << t.exception().what();
+            }
 
-                g_total_cnt.fetch_add(1, std::memory_order_relaxed);
-                state->total_inflight.fetch_sub(1, std::memory_order_relaxed);
-                auto processed = state->total_processed.fetch_add(1, std::memory_order_relaxed) + 1;
+            uint64_t last = g_client_last_update_time.load(std::memory_order_relaxed);
+            if (recv_time > last && recv_time - last > 100000) {
+              if (g_client_last_update_time.compare_exchange_weak(
+                      last, recv_time, std::memory_order_relaxed)) {
+                auto snap = util::g_snapshot.load(std::memory_order_acquire);
+                stats.client_cpu_usage.addValue(snap.cpu_percent);
+                stats.client_mem_usage.addValue(snap.mem_percent);
+              }
+            }
 
-                if (!g_stop.load(std::memory_order_acquire)) {
-                    if (FLAGS_test_iterations > 0 &&
-                        processed >= static_cast<uint64_t>(FLAGS_test_iterations)) {
-                        g_stop.store(true, std::memory_order_release);
-                    } else if (FLAGS_test_iterations == 0 &&
-                               recv_time - state->start_time > FLAGS_test_seconds * 1000000LL) {
-                        g_stop.store(true, std::memory_order_release);
-                    } else {
-                        (*send_request)(idx);  // 通过 shared_ptr 调用
-                    }
-                }
-            });
-        } else {
-            example::universal::UniversalRequest univ_req;
-            univ_req.type() = state->serialization_handler->getType();
-            *univ_req.payload() = state->serialized_payload;
+            g_total_cnt.fetch_add(1, std::memory_order_relaxed);
+            state->total_inflight.fetch_sub(1, std::memory_order_relaxed);
+            auto processed = state->total_processed.fetch_add(1, std::memory_order_relaxed) + 1;
 
-            ctx.universal_client->semifuture_test(univ_req)
-                .via(cpu_executor)
-                .thenTry([state, idx, send_time, send_request](folly::Try<example::universal::UniversalResponse>&& t) {
-                    int64_t recv_time = monotonic_us();
-                    int64_t latency_us = recv_time - send_time;
-
-                    int stats_idx = get_stats_idx();
-                    ThreadStats& stats = *g_stats_per_cpu[stats_idx];
-
-                    if (t.hasValue()) {
-                        stats.latency.addValue(latency_us);
-                        stats.success.fetch_add(1, std::memory_order_relaxed);
-                        state->serialization_handler->processResponse(*t.value().payload(), stats);
-                    } else {
-                        stats.fail.fetch_add(1, std::memory_order_relaxed);
-                        LOG(ERROR) << "RPC failed: " << t.exception().what();
-                    }
-
-                    uint64_t last = g_client_last_update_time.load(std::memory_order_relaxed);
-                    if (recv_time > last && recv_time - last > 100000) {
-                        if (g_client_last_update_time.compare_exchange_weak(
-                                last, recv_time, std::memory_order_relaxed)) {
-                            auto snap = util::g_snapshot.load(std::memory_order_acquire);
-                            stats.client_cpu_usage.addValue(snap.cpu_percent);
-                            stats.client_mem_usage.addValue(snap.mem_percent);
-                        }
-                    }
-
-                    g_total_cnt.fetch_add(1, std::memory_order_relaxed);
-                    state->total_inflight.fetch_sub(1, std::memory_order_relaxed);
-                    auto processed = state->total_processed.fetch_add(1, std::memory_order_relaxed) + 1;
-
-                    if (!g_stop.load(std::memory_order_acquire)) {
-                        if (FLAGS_test_iterations > 0 &&
-                            processed >= static_cast<uint64_t>(FLAGS_test_iterations)) {
-                            g_stop.store(true, std::memory_order_release);
-                        } else if (FLAGS_test_iterations == 0 &&
-                                   recv_time - state->start_time > FLAGS_test_seconds * 1000000LL) {
-                            g_stop.store(true, std::memory_order_release);
-                        } else {
-                            (*send_request)(idx);
-                        }
-                    }
-                });
-        }
-    };
-
-    // Initialize: distribute queue_depth across all connections
-    for (int i = 0; i < num_connections; ++i) {
-        for (int j = 0; j < FLAGS_queue_depth; ++j) {
-            state->ctxs[i]->evb->runInEventBaseThread([i, send_request]() {
-                (*send_request)(i);
-            });
-        }
+            if (!g_stop.load(std::memory_order_acquire)) {
+              if (FLAGS_test_iterations > 0 &&
+                  processed >= static_cast<uint64_t>(FLAGS_test_iterations)) {
+                g_stop.store(true, std::memory_order_release);
+              } else if (FLAGS_test_iterations == 0 &&
+                          recv_time - state->start_time > FLAGS_test_seconds * 1000000LL) {
+                g_stop.store(true, std::memory_order_release);
+              } else {
+                (*send_request)(idx);
+              }
+            }
+          });
     }
+  };
 
-    // Main thread waits for completion (all responses received)
-    while (!g_stop.load(std::memory_order_acquire) ||
-           state->total_inflight.load(std::memory_order_acquire) > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  // Initialize: distribute queue_depth across all connections
+  for (int i = 0; i < num_connections; ++i) {
+    for (int j = 0; j < FLAGS_queue_depth; ++j) {
+      state->ctxs[i]->evb->runInEventBaseThread([i, send_request]() {
+        (*send_request)(i);
+      });
     }
+  }
 
-    return state;
+  // Main thread waits for completion (all responses received)
+  while (!g_stop.load(std::memory_order_acquire) ||
+        state->total_inflight.load(std::memory_order_acquire) > 0) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+
+  return state;
 }
 
 // ============ Single Test Run ============

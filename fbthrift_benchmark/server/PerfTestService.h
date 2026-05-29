@@ -5,6 +5,7 @@
 #include "gen-cpp2/PerfTestService.h"
 #include "gen-cpp2/UniversalService.h"
 #include "util/LatencyStats.h"
+
 namespace press_test {
 
 class PerfTestServiceHandler
@@ -22,7 +23,7 @@ class PerfTestServiceHandler
 } // namespace press_test
 
 
-namespace example { namespace universal {
+namespace universal {
 
 class UniversalServiceHandler
     : virtual public apache::thrift::ServiceHandler<UniversalService> {
@@ -36,4 +37,4 @@ class UniversalServiceHandler
   static constexpr uint64_t CPU_UPDATE_INTERVAL_US = 100000;
 };
 
-}} // namespace example::universal
+} // namespace universal

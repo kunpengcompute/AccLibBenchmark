@@ -1,6 +1,4 @@
-namespace cpp2 example.universal
-namespace go example.if.universal
-namespace py3 example
+namespace cpp2 universal
 
 enum SerializationType {
     PROTOBUF = 1,

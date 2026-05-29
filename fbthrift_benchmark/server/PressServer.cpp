@@ -18,7 +18,7 @@ DEFINE_int32(num_cpu_threads, 1, "Number of CPU worker threads");
 using apache::thrift::RocketRoutingHandler;
 using apache::thrift::ThriftServer;
 using press_test::PerfTestServiceHandler;
-using example::universal::UniversalServiceHandler;
+using universal::UniversalServiceHandler;
 
 std::shared_ptr<ThriftServer> g_server;
 std::shared_ptr<ThriftServer> g_universal_server;
