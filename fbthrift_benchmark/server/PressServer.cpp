@@ -1,7 +1,6 @@
 #include <signal.h>
 #include <atomic>
 
-#include <glog/logging.h>
 #include <folly/init/Init.h>
 #include <folly/portability/GFlags.h>
 #include <thrift/lib/cpp2/server/ThriftServer.h>
@@ -10,6 +9,7 @@
 #include "server/PerfTestService.h"
 #include "util/ResourceMonitor.h"
 #include <thrift/lib/cpp2/gen/client_cpp.h>
+
 DEFINE_int32(port, 8002, "TCP Port of this server");
 DEFINE_int32(num_io_threads, 1, "Number of IO worker threads");
 DEFINE_int32(num_cpu_threads, 1, "Number of CPU worker threads");
@@ -108,7 +108,6 @@ std::shared_ptr<ThriftServer> newServer(int32_t port, int32_t num_io_threads, in
   server->setNumIOWorkerThreads(num_io_threads);
   server->setNumCPUWorkerThreads(num_cpu_threads);
   server->addRoutingHandler(createRocketRoutingHandler(server));
-
 
   return server;
 }

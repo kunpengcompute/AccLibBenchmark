@@ -9,6 +9,8 @@ list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third")
 
+find_package(Gflags REQUIRED)
+find_package(Glog REQUIRED)
 find_package(FBThrift REQUIRED)
 find_package(fizz REQUIRED)
 find_package(fmt REQUIRED)

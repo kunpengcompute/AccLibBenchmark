@@ -20,7 +20,6 @@
 #include <folly/executors/IOThreadPoolExecutor.h>
 #include <folly/synchronization/Baton.h>
 #include <gflags/gflags.h>
-#include <glog/logging.h>
 #include <thrift/lib/cpp2/async/HeaderClientChannel.h>
 // #include <thrift/lib/cpp2/async/HTTPClientChannel.h>
 #include <thrift/lib/cpp2/async/RocketClientChannel.h>
@@ -40,7 +39,8 @@ DEFINE_bool(echo_attachment, false, "Echo payload back");
 DEFINE_int32(rpc_timeout_ms, 2000, "RPC timeout in ms");
 DEFINE_int32(test_seconds, 20, "Test duration");
 DEFINE_int32(test_iterations, 0, "Test iterations (0 = time-based)");
-DEFINE_string(compression, "none", "Compression algorithm: none, zlib, zstd");
+DEFINE_string(thrift_serialization, "thrift_binary", "Thrift serialization: thrift_binary, thrift_compact, thrift_json");
+DEFINE_string(compression, "none", "Compression algorithm: none, zlib, zstd, snappy, lz4");
 DEFINE_int32(connections, 100, "Total number of connections");
 
 // ============ New: Server-like thread config ============
@@ -132,15 +132,30 @@ std::optional<apache::thrift::CompressionConfig> getCompressionConfig(
 
   apache::thrift::CompressionConfig config;
   auto& codec = config.codecConfig().ensure();
-
   if (algo == "zstd") {
     codec.set_zstdConfig();
   } else if (algo == "zlib") {
     codec.set_zlibConfig();
+  } else if (algo == "snappy") {
+    codec.set_snappyConfig();
+  } else if (algo == "lz4") {
+    codec.set_lz4Config();
   } else {
     LOG(FATAL) << "Unsupported compression algorithm: " << algo;
   }
   return config;
+}
+
+apache::thrift::protocol::PROTOCOL_TYPES getProtocolId(const std::string& serialization) {
+  if (serialization == "thrift_binary") {
+    return apache::thrift::protocol::T_BINARY_PROTOCOL;
+  } else if (serialization == "thrift_compact") {
+    return apache::thrift::protocol::T_COMPACT_PROTOCOL;
+  } else if (serialization == "thrift_json") {
+    return apache::thrift::protocol::T_JSON_PROTOCOL;
+  }
+  LOG(FATAL) << "Unknown thrift serialization: " << serialization;
+  return apache::thrift::protocol::T_BINARY_PROTOCOL;
 }
 
 // ============ Protocol Factory ============
@@ -148,12 +163,14 @@ std::optional<apache::thrift::CompressionConfig> getCompressionConfig(
 std::unique_ptr<PerfTestClient> newPerfTestClient(
     folly::EventBase* evb,
     const folly::SocketAddress& addr,
-    const std::string& transport) {
+    const std::string& transport,
+    apache::thrift::protocol::PROTOCOL_TYPES protocolId) {
 
   auto socket = folly::AsyncSocket::newSocket(evb, addr);
 
   if (transport == "rocket") {
     auto channel = apache::thrift::RocketClientChannel::newChannel(std::move(socket));
+    channel->setProtocolId(protocolId);
     if (FLAGS_rpc_timeout_ms > 0) {
       channel->setTimeout(FLAGS_rpc_timeout_ms);
     }
@@ -163,7 +180,9 @@ std::unique_ptr<PerfTestClient> newPerfTestClient(
     return std::make_unique<PerfTestClient>(std::move(channel));
 
   } else if (transport == "header") {
-    auto channel = apache::thrift::HeaderClientChannel::newChannel(std::move(socket));
+    apache::thrift::HeaderClientChannel::Options options;
+    options.setProtocolId(protocolId);
+    auto channel = apache::thrift::HeaderClientChannel::newChannel(std::move(socket), std::move(options));
     if (FLAGS_rpc_timeout_ms > 0) {
       channel->setTimeout(FLAGS_rpc_timeout_ms);
     }
@@ -230,7 +249,7 @@ std::shared_ptr<BenchmarkState> run_benchmark(
         folly::Baton<> baton;
         std::unique_ptr<PerfTestClient> client;
         ctx->evb->runInEventBaseThread([&]() {
-            client = newPerfTestClient(ctx->evb, addr, FLAGS_transport);
+            client = newPerfTestClient(ctx->evb, addr, FLAGS_transport, getProtocolId(FLAGS_thrift_serialization));
             baton.post();
         });
         baton.wait();
@@ -364,6 +383,7 @@ void test_once(int payload_size) {
             << ", Depth: " << FLAGS_queue_depth
             << ", Payload: " << payload_size << "B"
             << ", Transport: " << FLAGS_transport
+            << ", Serialization: " << FLAGS_thrift_serialization
             << ", QPS: " << (FLAGS_expected_qps > 0 ? std::to_string(FLAGS_expected_qps) : "unlimited")
             << ", Duration: " << FLAGS_test_seconds << "s"
             << ", Echo: " << (FLAGS_echo_attachment ? "yes" : "no")
@@ -620,7 +640,6 @@ void test_once(int payload_size) {
             << " p999=" << response_deserialize_p999;
 
   LOG(INFO) << "================================"; 
-
 }
 
 // ============ main ============
