@@ -1,0 +1,52 @@
+syntax = "proto3";
+package press_test_proto; 
+
+option cc_enable_arenas = true;
+option cc_generic_services = true;
+
+message Request {
+    ValueMap common_feat = 1;
+    repeated ValueMap ad_feat = 2;
+    repeated ValueMap labels = 3;
+    bool echo_attachment = 4;
+    bytes payload = 5; // 兼容原代码中的 payload 逻辑
+}
+
+message Value {
+    message StringList { repeated string value = 1; }
+    message IntList { repeated int64 value = 1; }
+    message DoubleList { repeated double value = 1; }
+    message ByteList { repeated bytes value = 2; }
+
+    oneof value {
+        string s_value = 1;
+        int64 i_value = 2;
+        double d_value = 3;
+        bytes b_value = 4;
+        StringList s_list = 5;
+        IntList i_list = 6;
+        DoubleList d_list = 7;
+        ByteList b_list = 8;
+    }
+}
+
+message ValueMap {
+    map<string, Value> value_map = 1;
+}
+
+message Requests {
+    repeated Request requests = 1;
+}
+
+message PerfTestResponse {
+    string cpu_usage = 1;
+    bytes payload = 2;
+    int64 server_request_decompress_avg_ns = 3;
+    int64 server_request_decompress_p99_ns = 4;
+    int64 server_response_compress_avg_ns = 5;
+    int64 server_response_compress_p99_ns = 6;
+}
+
+service PerfTestService {
+    rpc Test(Request) returns (PerfTestResponse);
+};

@@ -3,10 +3,12 @@
 这是一个基于 Facebook Thrift (fbthrift) 的简单 Echo RPC 压测工具示例，包含：
 
 - Thrift IDL 定义
+- Proto IDL 定义
 - fbthrift 服务端（press_server）
 - fbthrift 压测客户端（press_client）
 - 支持 Rocket / Header 两种传输协议
-- 支持 zlib / zstd / none 压缩
+- 支持 zlib / zstd / snappy / lz4 / none 压缩
+- 支持 binary / compact / json / protobuf 序列化
 
 ---
 
@@ -20,6 +22,7 @@
 - folly
 - glog
 - proxygen
+- protobuf
 
  依赖库安装到 third 目录下
 
@@ -31,7 +34,8 @@ third
 ├── folly
 ├── glog
 ├── proxygen
-└── wangle
+├── wangle
+└── protobuf
 ```
 
 ## 二、代码生成
@@ -39,6 +43,8 @@ third
 使用 thrift1 生成 C++（mstch_cpp2）代码：
 
 thrift1 --gen mstch_cpp2 press.thrift
+thrift1 --gen mstch_cpp2 universal.thrift
+protoc --cpp_out=./gen-cpp2 press.proto
 
 ## 三、编译构建
 

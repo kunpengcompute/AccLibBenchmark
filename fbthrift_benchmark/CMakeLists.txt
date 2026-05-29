@@ -8,6 +8,7 @@ set(CMAKE_BUILD_TYPE Debug)
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third")
+list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third/protobuf/lib64/cmake")
 
 find_package(Gflags REQUIRED)
 find_package(Glog REQUIRED)
@@ -17,6 +18,7 @@ find_package(fmt REQUIRED)
 find_package(folly REQUIRED)
 find_package(proxygen REQUIRED)
 find_package(wangle REQUIRED)
+find_package(protobuf REQUIRED)
 
 file(GLOB GEN_CPP_SOURCES CONFIGURE_DEPENDS "gen-cpp2/*.cpp")
 
@@ -28,10 +30,11 @@ set(COMMON_LIBS
     fizz::fizz
     fmt::fmt
     proxygen::proxygen
+    protobuf::libprotobuf
 )
 
 # 创建静态库，封装 Thrift 生成的代码
-add_library(thrift_generated STATIC ${GEN_CPP_SOURCES})
+add_library(thrift_generated STATIC ${GEN_CPP_SOURCES} gen-cpp2/press.pb.cc)
 
 # 让静态库获得依赖的头文件路径，并传递给下游
 target_link_libraries(thrift_generated PUBLIC ${COMMON_LIBS})

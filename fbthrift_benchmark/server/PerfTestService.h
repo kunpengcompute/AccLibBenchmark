@@ -3,8 +3,8 @@
 #include <atomic>
 #include <cstdint>
 #include "gen-cpp2/PerfTestService.h"
+#include "gen-cpp2/UniversalService.h"
 #include "util/LatencyStats.h"
-
 namespace press_test {
 
 class PerfTestServiceHandler
@@ -20,3 +20,20 @@ class PerfTestServiceHandler
 };
 
 } // namespace press_test
+
+
+namespace example { namespace universal {
+
+class UniversalServiceHandler
+    : virtual public apache::thrift::ServiceHandler<UniversalService> {
+ public:
+  void test(
+      UniversalResponse& response,
+      std::unique_ptr<UniversalRequest> request) override;
+
+ private:
+  static std::atomic<uint64_t> g_last_resource_update_time;
+  static constexpr uint64_t CPU_UPDATE_INTERVAL_US = 100000;
+};
+
+}} // namespace example::universal

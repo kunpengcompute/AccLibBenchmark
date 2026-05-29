@@ -24,10 +24,12 @@
 // #include <thrift/lib/cpp2/async/HTTPClientChannel.h>
 #include <thrift/lib/cpp2/async/RocketClientChannel.h>
 #include <thrift/lib/cpp2/transport/rocket/PayloadUtils.h>
+#include <thrift/lib/cpp2/gen/client_cpp.h>
 #include "gen-cpp2/PerfTestService.h"
+#include "gen-cpp2/UniversalService.h"
+#include "gen-cpp2/press.pb.h"
 #include "util/LatencyStats.h"
 #include "util/ResourceMonitor.h"
-#include <thrift/lib/cpp2/gen/client_cpp.h>
 
 DEFINE_string(host, "127.0.0.1", "Server host");
 DEFINE_int32(port, 8002, "Server port");
@@ -39,7 +41,9 @@ DEFINE_bool(echo_attachment, false, "Echo payload back");
 DEFINE_int32(rpc_timeout_ms, 2000, "RPC timeout in ms");
 DEFINE_int32(test_seconds, 20, "Test duration");
 DEFINE_int32(test_iterations, 0, "Test iterations (0 = time-based)");
+DEFINE_string(mode, "native", "Client mode: native, universal");
 DEFINE_string(thrift_serialization, "thrift_binary", "Thrift serialization: thrift_binary, thrift_compact, thrift_json");
+DEFINE_string(universal_serialization, "none", "Universal serialization: protobuf, simdjson");
 DEFINE_string(compression, "none", "Compression algorithm: none, zlib, zstd, snappy, lz4");
 DEFINE_int32(connections, 100, "Total number of connections");
 
@@ -48,20 +52,21 @@ DEFINE_int32(io_threads, 10, "Number of IO threads (EventBase count)");
 DEFINE_int32(cpu_threads, 0, "Number of CPU worker threads (0 = use hardware_concurrency)");
 
 using PerfTestClient = apache::thrift::Client<press_test::PerfTestService>;
+using UniversalClient = apache::thrift::Client<example::universal::UniversalService>;
 static std::atomic<uint64_t> g_client_last_update_time{0};
 
 // ============ Global State ============
 
 // Per-CPU-core stats (no lock needed, each callback thread writes to its own)
 struct alignas(64) ThreadStats {
-    util::HistogramStats<int64_t> latency{100, 0, 5000000};
-    util::HistogramStats<double>   server_cpu_usage{1, 0.0, 30000.0};
-    util::HistogramStats<double>   client_cpu_usage{1, 0.0, 30000.0};
-    util::HistogramStats<double>   server_mem_usage{1, 0.0, 100.0};
-    util::HistogramStats<double>   client_mem_usage{1, 0.0, 100.0};
+  util::HistogramStats<int64_t>  latency{100, 0, 5000000};
+  util::HistogramStats<double>   server_cpu_usage{1, 0.0, 30000.0};
+  util::HistogramStats<double>   client_cpu_usage{1, 0.0, 30000.0};
+  util::HistogramStats<double>   server_mem_usage{1, 0.0, 100.0};
+  util::HistogramStats<double>   client_mem_usage{1, 0.0, 100.0};
 
-    std::atomic<uint64_t> success{0};
-    std::atomic<uint64_t> fail{0};
+  std::atomic<uint64_t> success{0};
+  std::atomic<uint64_t> fail{0};
 };
 
 // CPU thread count determines stats array size
@@ -85,16 +90,16 @@ int64_t monotonic_us() {
 }
 
 std::string generate_payload(int size) {
-    std::string payload;
-    payload.resize(size);
+  std::string payload;
+  payload.resize(size);
 
-    thread_local std::mt19937_64 rng(std::random_device{}());
-    std::uniform_int_distribution<int> dist(0, 255);
+  thread_local std::mt19937_64 rng(std::random_device{}());
+  std::uniform_int_distribution<int> dist(0, 255);
 
-    for (int i = 0; i < size; ++i) {
-        payload[i] = static_cast<char>(dist(rng));
-    }
-    return payload;
+  for (int i = 0; i < size; ++i) {
+    payload[i] = static_cast<char>(dist(rng));
+  }
+  return payload;
 }
 
 // ============ Token Bucket Thread ============
@@ -158,9 +163,10 @@ apache::thrift::protocol::PROTOCOL_TYPES getProtocolId(const std::string& serial
   return apache::thrift::protocol::T_BINARY_PROTOCOL;
 }
 
-// ============ Protocol Factory ============
+// ============ Template Client Factory ============
 // Must be called in the EventBase thread
-std::unique_ptr<PerfTestClient> newPerfTestClient(
+template <typename ClientT>
+std::unique_ptr<ClientT> newThriftClient(
     folly::EventBase* evb,
     const folly::SocketAddress& addr,
     const std::string& transport,
@@ -177,7 +183,7 @@ std::unique_ptr<PerfTestClient> newPerfTestClient(
     if (auto config = getCompressionConfig(FLAGS_compression)) {
       channel->setDesiredCompressionConfig(*config);
     }
-    return std::make_unique<PerfTestClient>(std::move(channel));
+    return std::make_unique<ClientT>(std::move(channel));
 
   } else if (transport == "header") {
     apache::thrift::HeaderClientChannel::Options options;
@@ -189,7 +195,7 @@ std::unique_ptr<PerfTestClient> newPerfTestClient(
     if (auto config = getCompressionConfig(FLAGS_compression)) {
       channel->setDesiredCompressionConfig(*config);
     }
-    return std::make_unique<PerfTestClient>(std::move(channel));
+    return std::make_unique<ClientT>(std::move(channel));
 
   } else if (transport == "http2") {
     LOG(FATAL) << "http2 transport is not supported yet";
@@ -199,32 +205,113 @@ std::unique_ptr<PerfTestClient> newPerfTestClient(
   return nullptr;
 }
 
+// Aliases for backward compatibility
+inline std::unique_ptr<PerfTestClient> newPerfTestClient(
+    folly::EventBase* evb,
+    const folly::SocketAddress& addr,
+    const std::string& transport,
+    apache::thrift::protocol::PROTOCOL_TYPES protocolId) {
+  return newThriftClient<PerfTestClient>(evb, addr, transport, protocolId);
+}
+
+inline std::unique_ptr<UniversalClient> newUniversalClient(
+    folly::EventBase* evb,
+    const folly::SocketAddress& addr,
+    const std::string& transport,
+    apache::thrift::protocol::PROTOCOL_TYPES protocolId) {
+  return newThriftClient<UniversalClient>(evb, addr, transport, protocolId);
+}
+
 // Get thread-local stats index based on CPU thread pool thread id
 static thread_local int g_stats_idx = -1;
 
 static int get_stats_idx() {
-    if (g_stats_idx < 0) {
-        // First time in this thread, assign an index
-        static std::atomic<int> next_idx{0};
-        g_stats_idx = next_idx.fetch_add(1) % static_cast<int>(g_stats_per_cpu.size());
+  if (g_stats_idx < 0) {
+    // First time in this thread, assign an index
+    static std::atomic<int> next_idx{0};
+    g_stats_idx = next_idx.fetch_add(1) % static_cast<int>(g_stats_per_cpu.size());
+  }
+  return g_stats_idx;
+}
+
+// ============ Serialization Handler (for universal mode) ============
+struct SerializationHandler {
+  virtual ~SerializationHandler() = default;
+  virtual std::string serialize(const std::string& payload, bool echo_attachment) = 0;
+  virtual void processResponse(const std::string& payload, ThreadStats& stats) = 0;
+  virtual example::universal::SerializationType getType() const = 0;
+};
+
+struct ProtobufHandler : SerializationHandler {
+  std::string serialize(const std::string& payload, bool echo_attachment) override {
+    press_test_proto::Request req;
+    req.set_echo_attachment(echo_attachment);
+    req.set_payload(payload);
+    return req.SerializeAsString();
+  }
+
+  void processResponse(const std::string& payload, ThreadStats& stats) override {
+    press_test_proto::PerfTestResponse resp;
+    if (resp.ParseFromString(payload)) {
+      try {
+        double cpu_val = std::stod(resp.cpu_usage());
+        if (cpu_val > 0) {
+          stats.server_cpu_usage.addValue(cpu_val);
+        }
+      } catch (...) {}
+      g_total_bytes.fetch_add(resp.payload().size(), std::memory_order_relaxed);
     }
-    return g_stats_idx;
+  }
+
+  example::universal::SerializationType getType() const override {
+    return example::universal::SerializationType::PROTOBUF;
+  }
+};
+
+struct SimdJsonHandler : SerializationHandler {
+  std::string serialize(const std::string& payload, bool echo_attachment) override {
+    LOG(FATAL) << "SimdJson serialization not implemented yet";
+    return "";
+  }
+
+  void processResponse(const std::string& payload, ThreadStats& stats) override {
+    LOG(FATAL) << "SimdJson deserialization not implemented yet";
+  }
+
+  example::universal::SerializationType getType() const override {
+    LOG(FATAL) << "SimdJson serialization type not defined";
+    return example::universal::SerializationType::SIMD_JSON;
+  }
+};
+
+std::unique_ptr<SerializationHandler> createSerializationHandler(const std::string& type) {
+  if (type == "protobuf") {
+    return std::make_unique<ProtobufHandler>();
+  } else if (type == "simdjson") {
+    return std::make_unique<SimdJsonHandler>();
+  }
+  LOG(FATAL) << "Unknown universal serialization: " << type;
+  return nullptr;
 }
 
 // ============ Connection Context ============
 struct ConnContext {
-    folly::EventBase* evb;
-    std::unique_ptr<PerfTestClient> client;
-    int evb_idx;
+  folly::EventBase* evb;
+  std::unique_ptr<PerfTestClient> client;
+  std::unique_ptr<UniversalClient> universal_client;
+  int evb_idx;
 };
 
 // ============ FIX: 把关键状态包装成 shared_ptr，彻底避免悬空引用 ============
 struct BenchmarkState {
-    std::vector<std::unique_ptr<ConnContext>> ctxs;
-    press_test::Request request;
-    uint64_t start_time{0};
-    std::atomic<int> total_inflight{0};
-    std::atomic<uint64_t> total_processed{0};
+  std::vector<std::unique_ptr<ConnContext>> ctxs;
+  press_test::Request request;
+  std::string serialized_payload;
+  std::unique_ptr<SerializationHandler> serialization_handler;
+  bool is_native_mode;
+  uint64_t start_time{0};
+  std::atomic<int> total_inflight{0};
+  std::atomic<uint64_t> total_processed{0};
 };
 
 // ============ Main thread drives all connections ============
@@ -237,8 +324,19 @@ std::shared_ptr<BenchmarkState> run_benchmark(
 
     int num_connections = FLAGS_connections;
     int num_evbs = static_cast<int>(evb_list.size());
+    bool is_native_mode = (FLAGS_mode == "native");
+    auto protocolId = getProtocolId(FLAGS_thrift_serialization);
+
+    if (!is_native_mode && FLAGS_universal_serialization == "none") {
+      LOG(FATAL) << "universal_serialization must be set when mode is universal";
+    }
 
     auto state = std::make_shared<BenchmarkState>();
+    state->is_native_mode = is_native_mode;
+
+    if (!is_native_mode) {
+      state->serialization_handler = createSerializationHandler(FLAGS_universal_serialization);
+    }
 
     for (int i = 0; i < num_connections; ++i) {
         auto ctx = std::make_unique<ConnContext>();
@@ -246,14 +344,25 @@ std::shared_ptr<BenchmarkState> run_benchmark(
         ctx->evb = evb_list[ctx->evb_idx];
 
         // Create client in the EventBase thread
-        folly::Baton<> baton;
-        std::unique_ptr<PerfTestClient> client;
-        ctx->evb->runInEventBaseThread([&]() {
-            client = newPerfTestClient(ctx->evb, addr, FLAGS_transport, getProtocolId(FLAGS_thrift_serialization));
-            baton.post();
-        });
-        baton.wait();
-        ctx->client = std::move(client);
+        if (is_native_mode) {
+            folly::Baton<> baton;
+            std::unique_ptr<PerfTestClient> client;
+            ctx->evb->runInEventBaseThread([&]() {
+                client = newPerfTestClient(ctx->evb, addr, FLAGS_transport, protocolId);
+                baton.post();
+            });
+            baton.wait();
+            ctx->client = std::move(client);
+        } else {
+            folly::Baton<> baton;
+            std::unique_ptr<UniversalClient> uclient;
+            ctx->evb->runInEventBaseThread([&]() {
+                uclient = newUniversalClient(ctx->evb, addr, FLAGS_transport, protocolId);
+                baton.post();
+            });
+            baton.wait();
+            ctx->universal_client = std::move(uclient);
+        }
 
         state->ctxs.push_back(std::move(ctx));
     }
@@ -261,6 +370,10 @@ std::shared_ptr<BenchmarkState> run_benchmark(
     state->request.echo_attachment() = FLAGS_echo_attachment;
     state->request.payload() = payload;
     state->start_time = monotonic_us();
+
+    if (!is_native_mode && state->serialization_handler) {
+      state->serialized_payload = state->serialization_handler->serialize(payload, FLAGS_echo_attachment);
+    }
 
     // ========================================================================
     // FIX: 用 shared_ptr 包装 send_request，值捕获 state，彻底避免悬空
@@ -299,9 +412,10 @@ std::shared_ptr<BenchmarkState> run_benchmark(
         state->total_inflight.fetch_add(1, std::memory_order_relaxed);
         int64_t send_time = monotonic_us();
 
-        ctx.client->semifuture_test(state->request)
-            .via(cpu_executor)
-            .thenTry([state, idx, send_time, send_request](folly::Try<press_test::PerfTestResponse>&& t) {
+        if (state->is_native_mode) {
+            ctx.client->semifuture_test(state->request)
+                .via(cpu_executor)
+                .thenTry([state, idx, send_time, send_request](folly::Try<press_test::PerfTestResponse>&& t) {
                 int64_t recv_time = monotonic_us();
                 int64_t latency_us = recv_time - send_time;
 
@@ -349,6 +463,56 @@ std::shared_ptr<BenchmarkState> run_benchmark(
                     }
                 }
             });
+        } else {
+            example::universal::UniversalRequest univ_req;
+            univ_req.type() = state->serialization_handler->getType();
+            *univ_req.payload() = state->serialized_payload;
+
+            ctx.universal_client->semifuture_test(univ_req)
+                .via(cpu_executor)
+                .thenTry([state, idx, send_time, send_request](folly::Try<example::universal::UniversalResponse>&& t) {
+                    int64_t recv_time = monotonic_us();
+                    int64_t latency_us = recv_time - send_time;
+
+                    int stats_idx = get_stats_idx();
+                    ThreadStats& stats = *g_stats_per_cpu[stats_idx];
+
+                    if (t.hasValue()) {
+                        stats.latency.addValue(latency_us);
+                        stats.success.fetch_add(1, std::memory_order_relaxed);
+                        state->serialization_handler->processResponse(*t.value().payload(), stats);
+                    } else {
+                        stats.fail.fetch_add(1, std::memory_order_relaxed);
+                        LOG(ERROR) << "RPC failed: " << t.exception().what();
+                    }
+
+                    uint64_t last = g_client_last_update_time.load(std::memory_order_relaxed);
+                    if (recv_time > last && recv_time - last > 100000) {
+                        if (g_client_last_update_time.compare_exchange_weak(
+                                last, recv_time, std::memory_order_relaxed)) {
+                            auto snap = util::g_snapshot.load(std::memory_order_acquire);
+                            stats.client_cpu_usage.addValue(snap.cpu_percent);
+                            stats.client_mem_usage.addValue(snap.mem_percent);
+                        }
+                    }
+
+                    g_total_cnt.fetch_add(1, std::memory_order_relaxed);
+                    state->total_inflight.fetch_sub(1, std::memory_order_relaxed);
+                    auto processed = state->total_processed.fetch_add(1, std::memory_order_relaxed) + 1;
+
+                    if (!g_stop.load(std::memory_order_acquire)) {
+                        if (FLAGS_test_iterations > 0 &&
+                            processed >= static_cast<uint64_t>(FLAGS_test_iterations)) {
+                            g_stop.store(true, std::memory_order_release);
+                        } else if (FLAGS_test_iterations == 0 &&
+                                   recv_time - state->start_time > FLAGS_test_seconds * 1000000LL) {
+                            g_stop.store(true, std::memory_order_release);
+                        } else {
+                            (*send_request)(idx);
+                        }
+                    }
+                });
+        }
     };
 
     // Initialize: distribute queue_depth across all connections
@@ -370,7 +534,6 @@ std::shared_ptr<BenchmarkState> run_benchmark(
 }
 
 // ============ Single Test Run ============
-
 void test_once(int payload_size) {
   std::string payload = generate_payload(payload_size);
 
@@ -401,7 +564,7 @@ void test_once(int payload_size) {
   // Initialize per-CPU stats
   g_stats_per_cpu.clear();
   for (int i = 0; i < cpu_thread_num; ++i) {
-      g_stats_per_cpu.push_back(std::make_unique<ThreadStats>());
+    g_stats_per_cpu.push_back(std::make_unique<ThreadStats>());
   }
 
   std::vector<folly::EventBase*> evbs;
@@ -411,7 +574,7 @@ void test_once(int payload_size) {
   // Create IO thread pool
   auto io_executor = std::make_shared<folly::IOThreadPoolExecutor>(io_thread_num);
   for (int i = 0; i < io_thread_num; ++i) {
-      evbs.push_back(io_executor->getEventBase());
+    evbs.push_back(io_executor->getEventBase());
   }
 
   // Create CPU thread pool
@@ -482,14 +645,22 @@ void test_once(int payload_size) {
 
   // Now safe to destroy clients (no callbacks running)
   for (auto& ctx : state->ctxs) {
-      folly::Baton<> baton;
-      auto* evb = ctx->evb;
+    folly::Baton<> baton;
+    auto* evb = ctx->evb;
+    if (state->is_native_mode) {
       auto client_ptr = ctx->client.release();
       evb->runInEventBaseThread([client_ptr, &baton]() {
-          delete client_ptr;
-          baton.post();
+        delete client_ptr;
+        baton.post();
       });
-      baton.wait();
+    } else {
+      auto client_ptr = ctx->universal_client.release();
+      evb->runInEventBaseThread([client_ptr, &baton]() {
+        delete client_ptr;
+        baton.post();
+      });
+    }
+    baton.wait();
   }
   state->ctxs.clear();
 
@@ -516,14 +687,14 @@ void test_once(int payload_size) {
   uint64_t total_fail = 0;
 
   for (auto& stats_ptr : g_stats_per_cpu) {
-      ThreadStats& stats = *stats_ptr;
-      total_latency.merge(stats.latency);
-      total_server_cpu.merge(stats.server_cpu_usage);
-      total_client_cpu.merge(stats.client_cpu_usage);
-      total_server_mem.merge(stats.server_mem_usage);
-      total_client_mem.merge(stats.client_mem_usage);
-      total_success += stats.success.load();
-      total_fail += stats.fail.load();
+    ThreadStats& stats = *stats_ptr;
+    total_latency.merge(stats.latency);
+    total_server_cpu.merge(stats.server_cpu_usage);
+    total_client_cpu.merge(stats.client_cpu_usage);
+    total_server_mem.merge(stats.server_mem_usage);
+    total_client_mem.merge(stats.client_mem_usage);
+    total_success += stats.success.load();
+    total_fail += stats.fail.load();
   }
 
   uint64_t total_cnt = total_success + total_fail;
@@ -588,39 +759,39 @@ void test_once(int payload_size) {
   }
 
   if (FLAGS_compression != "none" && FLAGS_transport == "header") {
-      LOG(INFO) << "Header Compression (us):"
-                << " avg=" << std::fixed << std::setprecision(2) << header_compress_avg
-                << std::fixed << std::setprecision(0)
-                << " p50=" << header_compress_p50
-                << " p90=" << header_compress_p90
-                << " p99=" << header_compress_p99
-                << " p999=" << header_compress_p999;
+    LOG(INFO) << "Header Compression (us):"
+              << " avg=" << std::fixed << std::setprecision(2) << header_compress_avg
+              << std::fixed << std::setprecision(0)
+              << " p50=" << header_compress_p50
+              << " p90=" << header_compress_p90
+              << " p99=" << header_compress_p99
+              << " p999=" << header_compress_p999;
 
-      LOG(INFO) << "Header Decompression (us):"
-                << " avg=" << std::fixed << std::setprecision(2) << header_decompress_avg
-                << std::fixed << std::setprecision(0)
-                << " p50=" << header_decompress_p50
-                << " p90=" << header_decompress_p90
-                << " p99=" << header_decompress_p99
-                << " p999=" << header_decompress_p999;
+    LOG(INFO) << "Header Decompression (us):"
+              << " avg=" << std::fixed << std::setprecision(2) << header_decompress_avg
+              << std::fixed << std::setprecision(0)
+              << " p50=" << header_decompress_p50
+              << " p90=" << header_decompress_p90
+              << " p99=" << header_decompress_p99
+              << " p999=" << header_decompress_p999;
   }
 
   if (FLAGS_compression != "none" && FLAGS_transport == "rocket") {
-      LOG(INFO) << "Rocket Compression (us):"
-                << " avg=" << std::fixed << std::setprecision(2) << rocket_compress_avg
-                << std::fixed << std::setprecision(0)
-                << " p50=" << rocket_compress_p50
-                << " p90=" << rocket_compress_p90
-                << " p99=" << rocket_compress_p99
-                << " p999=" << rocket_compress_p999;
+    LOG(INFO) << "Rocket Compression (us):"
+              << " avg=" << std::fixed << std::setprecision(2) << rocket_compress_avg
+              << std::fixed << std::setprecision(0)
+              << " p50=" << rocket_compress_p50
+              << " p90=" << rocket_compress_p90
+              << " p99=" << rocket_compress_p99
+              << " p999=" << rocket_compress_p999;
 
-      LOG(INFO) << "Rocket Decompression (us):"
-                << " avg=" << std::fixed << std::setprecision(2) << rocket_decompress_avg
-                << std::fixed << std::setprecision(0)
-                << " p50=" << rocket_decompress_p50
-                << " p90=" << rocket_decompress_p90
-                << " p99=" << rocket_decompress_p99
-                << " p999=" << rocket_decompress_p999;
+    LOG(INFO) << "Rocket Decompression (us):"
+              << " avg=" << std::fixed << std::setprecision(2) << rocket_decompress_avg
+              << std::fixed << std::setprecision(0)
+              << " p50=" << rocket_decompress_p50
+              << " p90=" << rocket_decompress_p90
+              << " p99=" << rocket_decompress_p99
+              << " p999=" << rocket_decompress_p999;
   }
 
   LOG(INFO) << "Request Serialization (us) :"
