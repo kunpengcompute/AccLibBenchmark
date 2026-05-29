@@ -258,6 +258,10 @@ struct ProtobufHandler : SerializationHandler {
         if (cpu_val > 0) {
           stats.server_cpu_usage.addValue(cpu_val);
         }
+        double mem_val = std::stod(resp.mem_usage());
+        if (mem_val > 0) {
+          stats.server_mem_usage.addValue(mem_val);
+        }
       } catch (...) {}
       g_total_bytes.fetch_add(resp.payload().size(), std::memory_order_relaxed);
     }

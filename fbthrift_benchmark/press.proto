@@ -40,11 +40,8 @@ message Requests {
 
 message PerfTestResponse {
     string cpu_usage = 1;
-    bytes payload = 2;
-    int64 server_request_decompress_avg_ns = 3;
-    int64 server_request_decompress_p99_ns = 4;
-    int64 server_response_compress_avg_ns = 5;
-    int64 server_response_compress_p99_ns = 6;
+    string mem_usage = 2;
+    bytes payload = 3;
 }
 
 service PerfTestService {

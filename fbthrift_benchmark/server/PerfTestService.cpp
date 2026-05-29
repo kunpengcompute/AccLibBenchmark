@@ -73,11 +73,14 @@ void UniversalServiceHandler::test(
             last, now, std::memory_order_relaxed)) {
           auto snap = util::g_snapshot.load(std::memory_order_acquire);
           pb_resp.set_cpu_usage(std::to_string(snap.cpu_percent));
+          pb_resp.set_mem_usage(std::to_string(snap.mem_percent));
         } else {
           pb_resp.set_cpu_usage("-1.0");
+          pb_resp.set_mem_usage("-1.0");
         }
       } else {
         pb_resp.set_cpu_usage("-1.0");
+        pb_resp.set_mem_usage("-1.0");
       }
 
       *response.type() = SerializationType::PROTOBUF;
