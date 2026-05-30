@@ -25,6 +25,16 @@ class PerfTestServiceHandler
 
 namespace universal {
 
+struct ServerUnivStats {
+  double serialize_avg;
+  int64_t serialize_p50, serialize_p90, serialize_p99, serialize_p999;
+  double deserialize_avg;
+  int64_t deserialize_p50, deserialize_p90, deserialize_p99, deserialize_p999;
+};
+
+ServerUnivStats getServerUnivStats();
+void initUnivStats(int num_threads);
+
 class UniversalServiceHandler
     : virtual public apache::thrift::ServiceHandler<UniversalService> {
  public:

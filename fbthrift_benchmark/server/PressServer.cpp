@@ -61,7 +61,7 @@ void printRocketCompressionStats(){
 }
 
 void printRequestDeserializationStats(){
-  LOG(INFO) << "====== Server Request Deserialization Stats =======";
+  LOG(INFO) << "====== Native Request Deserialization Stats =======";
   LOG(INFO) << "Request Deserialization (us):"
             << " avg=" << std::fixed << std::setprecision(2) << apache::thrift::getRequestDeserializationAvg()
             << std::fixed << std::setprecision(0)
@@ -72,7 +72,7 @@ void printRequestDeserializationStats(){
 }
 
 void printResponseSerializationStats(){
-  LOG(INFO) << "====== Server Response Serialization Stats =======";
+  LOG(INFO) << "====== Native Response Serialization Stats =======";
   LOG(INFO) << "Response Serialization (us):"
             << " avg=" << std::fixed << std::setprecision(2) << apache::thrift::getResponseSerializationAvg()
             << std::fixed << std::setprecision(0)
@@ -80,6 +80,26 @@ void printResponseSerializationStats(){
             << " p90=" << apache::thrift::getResponseSerializationP90()
             << " p99=" << apache::thrift::getResponseSerializationP99()
             << " p999=" << apache::thrift::getResponseSerializationP999();
+}
+
+void printUniversalSerializationStats()
+{
+  auto s = universal::getServerUnivStats();
+  LOG(INFO) << "====== Universal Serialize/Deserialize Stats =======";
+  LOG(INFO) << "Universal Serialization (us):"
+            << " avg=" << std::fixed << std::setprecision(2) << s.serialize_avg
+            << std::fixed << std::setprecision(0)
+            << " p50=" << s.serialize_p50
+            << " p90=" << s.serialize_p90
+            << " p99=" << s.serialize_p99
+            << " p999=" << s.serialize_p999;
+  LOG(INFO) << "Universal Deserialization (us):"
+            << " avg=" << std::fixed << std::setprecision(2) << s.deserialize_avg
+            << std::fixed << std::setprecision(0)
+            << " p50=" << s.deserialize_p50
+            << " p90=" << s.deserialize_p90
+            << " p99=" << s.deserialize_p99
+            << " p999=" << s.deserialize_p999;
 }
 
 
@@ -90,6 +110,7 @@ void signalHandler(int sig) {
     printRocketCompressionStats();
     printRequestDeserializationStats();
     printResponseSerializationStats();
+    printUniversalSerializationStats();
     LOG(INFO) << "==================================";
     LOG(INFO) << "Received signal " << sig << ", stopping server...";
     if (g_server) {
@@ -126,6 +147,8 @@ int main(int argc, char** argv) {
 
   util::init_resource_collector();
 
+  universal::initUnivStats(FLAGS_num_cpu_threads);
+
   g_server = newServer<PerfTestServiceHandler>(FLAGS_port, FLAGS_num_io_threads, FLAGS_num_cpu_threads);
   g_universal_server = newServer<UniversalServiceHandler>(FLAGS_universal_port, FLAGS_num_io_threads, FLAGS_num_cpu_threads);
 
@@ -134,10 +157,10 @@ int main(int argc, char** argv) {
 
   LOG(INFO) << "PerfTest Server running on port: " << FLAGS_port
             << " with " << FLAGS_num_io_threads << " IO threads and "
-            << FLAGS_num_cpu_threads << " CPU threads (Rocket transport)";
+            << FLAGS_num_cpu_threads << " CPU threads";
   LOG(INFO) << "Universal Server running on port: " << FLAGS_universal_port
             << " with " << FLAGS_num_io_threads << " IO threads and "
-            << FLAGS_num_cpu_threads << " CPU threads (Rocket transport)";
+            << FLAGS_num_cpu_threads << " CPU threads";
 
   std::thread universal_td([&]() {
     g_universal_server->serve();

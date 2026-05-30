@@ -1,8 +1,7 @@
 #include <atomic>
-#include <iomanip>
 #include <iostream>
-#include <mutex>
-#include <thread>
+#include <memory>
+#include <vector>
 #include "server/PerfTestService.h"
 #include "util/ResourceMonitor.h"
 #include "gen-cpp2/press.pb.h"
@@ -46,6 +45,53 @@ namespace universal {
 
 std::atomic<uint64_t> UniversalServiceHandler::g_last_resource_update_time{0};
 
+struct alignas(64) UnivStatsSlot {
+  util::HistogramStats<int64_t> serialize{100, 0, 5000000};
+  util::HistogramStats<int64_t> deserialize{100, 0, 5000000};
+};
+
+static std::vector<std::unique_ptr<UnivStatsSlot>> g_univ_stats_slots;
+static thread_local int g_univ_slot_idx = -1;
+
+void initUnivStats(int num_threads) {
+  g_univ_stats_slots.clear();
+  int n = num_threads > 0 ? num_threads : 1;
+  for (int i = 0; i < n; ++i) {
+    g_univ_stats_slots.push_back(std::make_unique<UnivStatsSlot>());
+  }
+}
+
+static int get_univ_slot_idx() {
+  if (g_univ_slot_idx < 0) {
+    static std::atomic<int> next_idx{0};
+    g_univ_slot_idx = next_idx.fetch_add(1, std::memory_order_relaxed)
+                      % static_cast<int>(g_univ_stats_slots.size());
+  }
+  return g_univ_slot_idx;
+}
+
+ServerUnivStats getServerUnivStats() {
+  util::HistogramStats<int64_t> total_ser{100, 0, 5000000};
+  util::HistogramStats<int64_t> total_deser{100, 0, 5000000};
+  int num_slots = static_cast<int>(g_univ_stats_slots.size());
+  for (int i = 0; i < num_slots; ++i) {
+    total_ser.merge(g_univ_stats_slots[i]->serialize);
+    total_deser.merge(g_univ_stats_slots[i]->deserialize);
+  }
+  return {
+    total_ser.getAvg(),
+    total_ser.getPercentile(0.50),
+    total_ser.getPercentile(0.90),
+    total_ser.getPercentile(0.99),
+    total_ser.getPercentile(0.999),
+    total_deser.getAvg(),
+    total_deser.getPercentile(0.50),
+    total_deser.getPercentile(0.90),
+    total_deser.getPercentile(0.99),
+    total_deser.getPercentile(0.999),
+  };
+}
+
 void UniversalServiceHandler::universal_test(
     UniversalResponse& response,
     std::unique_ptr<UniversalRequest> request)
@@ -53,12 +99,15 @@ void UniversalServiceHandler::universal_test(
   switch (*request->type()) {
     case SerializationType::PROTOBUF: {
       press_test_proto::Request pb_req;
+      const auto deser_start  = std::chrono::steady_clock::now();
       if (!pb_req.ParseFromString(*request->payload())) {
         LOG(ERROR) << "Failed to parse protobuf request";
         *response.type() = SerializationType::PROTOBUF;
         *response.payload() = std::string();
         return;
       }
+      const auto deser_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - deser_start ).count();
+      g_univ_stats_slots[get_univ_slot_idx()]->deserialize.addValue(deser_us);
 
       press_test_proto::PerfTestResponse pb_resp;
       if (pb_req.echo_attachment()) {
@@ -84,7 +133,10 @@ void UniversalServiceHandler::universal_test(
       }
 
       *response.type() = SerializationType::PROTOBUF;
+      const auto ser_start = std::chrono::steady_clock::now();
       *response.payload() = pb_resp.SerializeAsString();
+      const auto ser_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - ser_start).count();
+      g_univ_stats_slots[get_univ_slot_idx()]->serialize.addValue(ser_us);
       break;
     }
     default: {

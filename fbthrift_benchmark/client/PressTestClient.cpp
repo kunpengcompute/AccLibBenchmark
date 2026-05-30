@@ -64,9 +64,11 @@ struct alignas(64) ThreadStats {
   util::HistogramStats<double>   client_cpu_usage{1, 0.0, 30000.0};
   util::HistogramStats<double>   server_mem_usage{1, 0.0, 100.0};
   util::HistogramStats<double>   client_mem_usage{1, 0.0, 100.0};
+  util::HistogramStats<int64_t>  universal_serialize{100, 0, 5000000};
+  util::HistogramStats<int64_t>  universal_deserialize{100, 0, 5000000};
 
-  std::atomic<uint64_t> success{0};
-  std::atomic<uint64_t> fail{0};
+  uint64_t success{0};
+  uint64_t fail{0};
 };
 
 // CPU thread count determines stats array size
@@ -229,7 +231,7 @@ static int get_stats_idx() {
   if (g_stats_idx < 0) {
     // First time in this thread, assign an index
     static std::atomic<int> next_idx{0};
-    g_stats_idx = next_idx.fetch_add(1) % static_cast<int>(g_stats_per_cpu.size());
+    g_stats_idx = next_idx.fetch_add(1, std::memory_order_relaxed) % static_cast<int>(g_stats_per_cpu.size());
   }
   return g_stats_idx;
 }
@@ -252,7 +254,10 @@ struct ProtobufHandler : SerializationHandler {
 
   void processResponse(const std::string& payload, ThreadStats& stats) override {
     press_test_proto::PerfTestResponse resp;
+    const auto deser_start = std::chrono::steady_clock::now();
     if (resp.ParseFromString(payload)) {
+      stats.universal_deserialize.addValue(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - deser_start).count());
       try {
         double cpu_val = std::stod(resp.cpu_usage());
         if (cpu_val > 0) {
@@ -310,7 +315,6 @@ struct ConnContext {
 struct BenchmarkState {
   std::vector<std::unique_ptr<ConnContext>> ctxs;
   press_test::Request request;
-  std::string serialized_payload;
   std::unique_ptr<SerializationHandler> serialization_handler;
   bool is_native_mode;
   uint64_t start_time{0};
@@ -375,10 +379,6 @@ std::shared_ptr<BenchmarkState> run_benchmark(
   state->request.payload() = payload;
   state->start_time = monotonic_us();
 
-  if (!is_native_mode && state->serialization_handler) {
-    state->serialized_payload = state->serialization_handler->serialize(payload, FLAGS_echo_attachment);
-  }
-
   // ========================================================================
   // FIX: 用 shared_ptr 包装 send_request，值捕获 state，彻底避免悬空
   // ========================================================================
@@ -414,9 +414,9 @@ std::shared_ptr<BenchmarkState> run_benchmark(
     }
 
     state->total_inflight.fetch_add(1, std::memory_order_relaxed);
-    int64_t send_time = monotonic_us();
 
     if (state->is_native_mode) {
+      int64_t send_time = monotonic_us();
       ctx.client->semifuture_native_test(state->request)
           .via(cpu_executor)
           .thenTry([state, idx, send_time, send_request](folly::Try<press_test::PerfTestResponse>&& t) {
@@ -428,7 +428,7 @@ std::shared_ptr<BenchmarkState> run_benchmark(
 
             if (t.hasValue()) {
               stats.latency.addValue(latency_us);
-              stats.success.fetch_add(1, std::memory_order_relaxed);
+              stats.success++;
               if (t.value().cpu_usage().value() > 0) {
                 stats.server_cpu_usage.addValue(t.value().cpu_usage().value());
               }
@@ -437,7 +437,7 @@ std::shared_ptr<BenchmarkState> run_benchmark(
               }
               g_total_bytes.fetch_add(state->request.payload()->size(), std::memory_order_relaxed);
             } else {
-              stats.fail.fetch_add(1, std::memory_order_relaxed);
+              stats.fail++;
               LOG(ERROR) << "RPC failed: " << t.exception().what();
             }
 
@@ -468,10 +468,17 @@ std::shared_ptr<BenchmarkState> run_benchmark(
             }
           });
     } else {
+      int64_t serialize_start = monotonic_us();
+      std::string serialized = state->serialization_handler->serialize(
+          *state->request.payload(), *state->request.echo_attachment());
+      int64_t univ_serialize_us = monotonic_us() - serialize_start;
+      g_stats_per_cpu[get_stats_idx()]->universal_serialize.addValue(univ_serialize_us);
+
       universal::UniversalRequest univ_req;
       univ_req.type() = state->serialization_handler->getType();
-      *univ_req.payload() = state->serialized_payload;
+      *univ_req.payload() = std::move(serialized);
 
+      int64_t send_time = monotonic_us();
       ctx.universal_client->semifuture_universal_test(univ_req)
           .via(cpu_executor)
           .thenTry([state, idx, send_time, send_request](folly::Try<universal::UniversalResponse>&& t) {
@@ -483,10 +490,10 @@ std::shared_ptr<BenchmarkState> run_benchmark(
 
             if (t.hasValue()) {
               stats.latency.addValue(latency_us);
-              stats.success.fetch_add(1, std::memory_order_relaxed);
+              stats.success++;
               state->serialization_handler->processResponse(*t.value().payload(), stats);
             } else {
-              stats.fail.fetch_add(1, std::memory_order_relaxed);
+              stats.fail++;
               LOG(ERROR) << "RPC failed: " << t.exception().what();
             }
 
@@ -687,6 +694,8 @@ void test_once(int payload_size) {
   util::HistogramStats<double> total_client_cpu(1, 0.0, 30000.0);
   util::HistogramStats<double> total_server_mem(1, 0.0, 100.0);
   util::HistogramStats<double> total_client_mem(1, 0.0, 100.0);
+  util::HistogramStats<int64_t> total_univ_serialize(100, 0, 5000000);
+  util::HistogramStats<int64_t> total_univ_deserialize(100, 0, 5000000);
   uint64_t total_success = 0;
   uint64_t total_fail = 0;
 
@@ -697,8 +706,10 @@ void test_once(int payload_size) {
     total_client_cpu.merge(stats.client_cpu_usage);
     total_server_mem.merge(stats.server_mem_usage);
     total_client_mem.merge(stats.client_mem_usage);
-    total_success += stats.success.load();
-    total_fail += stats.fail.load();
+    total_univ_serialize.merge(stats.universal_serialize);
+    total_univ_deserialize.merge(stats.universal_deserialize);
+    total_success += stats.success;
+    total_fail += stats.fail;
   }
 
   uint64_t total_cnt = total_success + total_fail;
@@ -798,7 +809,7 @@ void test_once(int payload_size) {
               << " p999=" << rocket_decompress_p999;
   }
 
-  LOG(INFO) << "Request Serialization (us) :"
+  LOG(INFO) << "Native Request Serialization (us) :"
             << " avg=" << std::fixed << std::setprecision(2) << request_serialize_avg
             << std::fixed << std::setprecision(0)
             << " p50=" << request_serialize_p50
@@ -806,13 +817,35 @@ void test_once(int payload_size) {
             << " p99=" << request_serialize_p99
             << " p999=" << request_serialize_p999;
 
-  LOG(INFO) << "Response Deserialization (us) :"
+  LOG(INFO) << "Native Response Deserialization (us) :"
             << " avg=" << std::fixed << std::setprecision(2) << response_deserialize_avg
             << std::fixed << std::setprecision(0)
             << " p50=" << response_deserialize_p50
             << " p90=" << response_deserialize_p90
             << " p99=" << response_deserialize_p99
             << " p999=" << response_deserialize_p999;
+
+  if (FLAGS_mode == "universal" && total_univ_serialize.getCount() > 0) {
+    LOG(INFO) << "Universal Request Serialization (us) :"
+              << " avg=" << std::fixed << std::setprecision(2) << total_univ_serialize.getAvg()
+              << " min=" << total_univ_serialize.getMin()
+              << " max=" << total_univ_serialize.getMax()
+              << std::fixed << std::setprecision(0)
+              << " p50=" << total_univ_serialize.getPercentile(0.50)
+              << " p90=" << total_univ_serialize.getPercentile(0.90)
+              << " p99=" << total_univ_serialize.getPercentile(0.99)
+              << " p999=" << total_univ_serialize.getPercentile(0.999);
+
+    LOG(INFO) << "Universal Response Deserialization (us) :"
+              << " avg=" << std::fixed << std::setprecision(2) << total_univ_deserialize.getAvg()
+              << " min=" << total_univ_deserialize.getMin()
+              << " max=" << total_univ_deserialize.getMax()
+              << std::fixed << std::setprecision(0)
+              << " p50=" << total_univ_deserialize.getPercentile(0.50)
+              << " p90=" << total_univ_deserialize.getPercentile(0.90)
+              << " p99=" << total_univ_deserialize.getPercentile(0.99)
+              << " p999=" << total_univ_deserialize.getPercentile(0.999);
+  }
 
   LOG(INFO) << "================================"; 
 }
