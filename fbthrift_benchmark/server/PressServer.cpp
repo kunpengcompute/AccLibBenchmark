@@ -84,21 +84,21 @@ void printResponseSerializationStats(){
 
 
 void signalHandler(int sig) {
-    if (!g_stop_requested.exchange(true)) {
-        LOG(INFO) << "==================================";
-        printHeaderCompressionStats();
-        printRocketCompressionStats();
-        printRequestDeserializationStats();
-        printResponseSerializationStats();
-        LOG(INFO) << "==================================";
-        LOG(INFO) << "Received signal " << sig << ", stopping server...";
-        if (g_server) {
-            g_server->stop();
-        }
-        if (g_universal_server) {
-            g_universal_server->stop();
-        }
+  if (!g_stop_requested.exchange(true)) {
+    LOG(INFO) << "==================================";
+    printHeaderCompressionStats();
+    printRocketCompressionStats();
+    printRequestDeserializationStats();
+    printResponseSerializationStats();
+    LOG(INFO) << "==================================";
+    LOG(INFO) << "Received signal " << sig << ", stopping server...";
+    if (g_server) {
+      g_server->stop();
     }
+    if (g_universal_server) {
+      g_universal_server->stop();
+    }
+  }
 }
 
 std::unique_ptr<RocketRoutingHandler> createRocketRoutingHandler(

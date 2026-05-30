@@ -19,5 +19,5 @@ struct UniversalResponse {
 }
 
 service UniversalService {
-    UniversalResponse test(1: UniversalRequest request);
+    UniversalResponse universal_test(1: UniversalRequest request);
 }

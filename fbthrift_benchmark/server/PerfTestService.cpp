@@ -13,7 +13,7 @@ std::atomic<uint64_t> PerfTestServiceHandler::g_last_resource_update_time{0};
 
 // ============ Handler 实现 ============
 
-void PerfTestServiceHandler::test(PerfTestResponse &response,
+void PerfTestServiceHandler::native_test(PerfTestResponse &response,
                                   std::unique_ptr<Request> req)
 {
   if (*req->echo_attachment()) {
@@ -46,7 +46,7 @@ namespace universal {
 
 std::atomic<uint64_t> UniversalServiceHandler::g_last_resource_update_time{0};
 
-void UniversalServiceHandler::test(
+void UniversalServiceHandler::universal_test(
     UniversalResponse& response,
     std::unique_ptr<UniversalRequest> request)
 {

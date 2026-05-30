@@ -12,5 +12,5 @@ struct PerfTestResponse {
 }
 
 service PerfTestService {
-    PerfTestResponse test(1: Request req);
+    PerfTestResponse native_test(1: Request req);
 }

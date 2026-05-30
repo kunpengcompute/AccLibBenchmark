@@ -417,7 +417,7 @@ std::shared_ptr<BenchmarkState> run_benchmark(
     int64_t send_time = monotonic_us();
 
     if (state->is_native_mode) {
-      ctx.client->semifuture_test(state->request)
+      ctx.client->semifuture_native_test(state->request)
           .via(cpu_executor)
           .thenTry([state, idx, send_time, send_request](folly::Try<press_test::PerfTestResponse>&& t) {
             int64_t recv_time = monotonic_us();
@@ -472,7 +472,7 @@ std::shared_ptr<BenchmarkState> run_benchmark(
       univ_req.type() = state->serialization_handler->getType();
       *univ_req.payload() = state->serialized_payload;
 
-      ctx.universal_client->semifuture_test(univ_req)
+      ctx.universal_client->semifuture_universal_test(univ_req)
           .via(cpu_executor)
           .thenTry([state, idx, send_time, send_request](folly::Try<universal::UniversalResponse>&& t) {
             int64_t recv_time = monotonic_us();
