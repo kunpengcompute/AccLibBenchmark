@@ -1,25 +1,22 @@
-// PressTestClient.cpp
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <iomanip>
 #include <iostream>
 #include <memory>
-#include <mutex>
-#include <sstream>
 #include <string>
 #include <thread>
+#include <variant>
 #include <vector>
 #include <random>
+#include <gflags/gflags.h>
 #include <folly/SocketAddress.h>
 #include <folly/init/Init.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
 #include <folly/synchronization/Baton.h>
-#include <gflags/gflags.h>
 #include <thrift/lib/cpp2/async/HeaderClientChannel.h>
 // #include <thrift/lib/cpp2/async/HTTPClientChannel.h>
 #include <thrift/lib/cpp2/async/RocketClientChannel.h>
@@ -79,9 +76,7 @@ std::atomic<uint64_t> g_total_bytes{0};
 std::atomic<uint64_t> g_total_cnt{0};
 
 // Token bucket rate limiter
-std::mutex g_token_mtx;
-std::condition_variable g_token_cv;
-int64_t g_token{0};
+std::atomic<int64_t> g_token{0};
 
 // ============ Utility Functions ============
 
@@ -119,12 +114,8 @@ void token_thread(int expected_qps) {
     int64_t expected = static_cast<int64_t>(expected_qps) * elapsed_us / 1000000;
     if (accumulative < expected) {
       int64_t delta = expected - accumulative;
-      {
-        std::lock_guard<std::mutex> lock(g_token_mtx);
-        g_token += delta;
-        accumulative += delta;
-      }
-      g_token_cv.notify_all();
+      g_token.fetch_add(delta, std::memory_order_relaxed);
+      accumulative += delta;
     }
 
     std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -207,23 +198,6 @@ std::unique_ptr<ClientT> newThriftClient(
   return nullptr;
 }
 
-// Aliases for backward compatibility
-inline std::unique_ptr<PerfTestClient> newPerfTestClient(
-    folly::EventBase* evb,
-    const folly::SocketAddress& addr,
-    const std::string& transport,
-    apache::thrift::protocol::PROTOCOL_TYPES protocolId) {
-  return newThriftClient<PerfTestClient>(evb, addr, transport, protocolId);
-}
-
-inline std::unique_ptr<UniversalClient> newUniversalClient(
-    folly::EventBase* evb,
-    const folly::SocketAddress& addr,
-    const std::string& transport,
-    apache::thrift::protocol::PROTOCOL_TYPES protocolId) {
-  return newThriftClient<UniversalClient>(evb, addr, transport, protocolId);
-}
-
 // Get thread-local stats index based on CPU thread pool thread id
 static thread_local int g_stats_idx = -1;
 
@@ -231,7 +205,11 @@ static int get_stats_idx() {
   if (g_stats_idx < 0) {
     // First time in this thread, assign an index
     static std::atomic<int> next_idx{0};
-    g_stats_idx = next_idx.fetch_add(1, std::memory_order_relaxed) % static_cast<int>(g_stats_per_cpu.size());
+    int idx = next_idx.fetch_add(1, std::memory_order_relaxed);
+    CHECK(idx < static_cast<int>(g_stats_per_cpu.size()))
+        << "More threads than stats slots: " << idx + 1
+        << " threads vs " << g_stats_per_cpu.size() << " slots";
+    g_stats_idx = idx;
   }
   return g_stats_idx;
 }
@@ -304,12 +282,28 @@ std::unique_ptr<SerializationHandler> createSerializationHandler(const std::stri
 }
 
 // ============ Connection Context ============
+using ClientVariant = std::variant<std::unique_ptr<PerfTestClient>,
+                                   std::unique_ptr<UniversalClient>>;
+
 struct ConnContext {
   folly::EventBase* evb;
-  std::unique_ptr<PerfTestClient> client;
-  std::unique_ptr<UniversalClient> universal_client;
+  ClientVariant client;
   int evb_idx;
 };
+
+// Create client in the EventBase thread
+template <typename ClientT>
+void createClientInEvb(ConnContext* ctx,
+                       const folly::SocketAddress& addr,
+                       const std::string& transport,
+                       apache::thrift::protocol::PROTOCOL_TYPES protocolId) {
+  folly::Baton<> baton;
+  ctx->evb->runInEventBaseThread([&]() {
+    ctx->client = newThriftClient<ClientT>(ctx->evb, addr, transport, protocolId);
+    baton.post();
+  });
+  baton.wait();
+}
 
 // ============ FIX: 把关键状态包装成 shared_ptr，彻底避免悬空引用 ============
 struct BenchmarkState {
@@ -351,25 +345,10 @@ std::shared_ptr<BenchmarkState> run_benchmark(
     ctx->evb_idx = i % num_evbs;
     ctx->evb = evb_list[ctx->evb_idx];
 
-    // Create client in the EventBase thread
     if (is_native_mode) {
-      folly::Baton<> baton;
-      std::unique_ptr<PerfTestClient> client;
-      ctx->evb->runInEventBaseThread([&]() {
-        client = newPerfTestClient(ctx->evb, addr, FLAGS_transport, protocolId);
-        baton.post();
-      });
-      baton.wait();
-      ctx->client = std::move(client);
+      createClientInEvb<PerfTestClient>(ctx.get(), addr, FLAGS_transport, protocolId);
     } else {
-      folly::Baton<> baton;
-      std::unique_ptr<UniversalClient> uclient;
-      ctx->evb->runInEventBaseThread([&]() {
-        uclient = newUniversalClient(ctx->evb, addr, FLAGS_transport, protocolId);
-        baton.post();
-      });
-      baton.wait();
-      ctx->universal_client = std::move(uclient);
+      createClientInEvb<UniversalClient>(ctx.get(), addr, FLAGS_transport, protocolId);
     }
 
     state->ctxs.push_back(std::move(ctx));
@@ -395,18 +374,15 @@ std::shared_ptr<BenchmarkState> run_benchmark(
 
     // QPS rate limiting
     if (FLAGS_expected_qps > 0) {
-      std::unique_lock<std::mutex> lock(g_token_mtx);
-      if (g_token <= 0) {
-        lock.unlock();
-        // 从 CPU 线程安全地回到 EventBase 线程再调 runAfterDelay
-        ctx.evb->runInEventBaseThread([idx, send_request, evb = ctx.evb]() {
-          evb->runAfterDelay([idx, send_request]() {
-            (*send_request)(idx);
-          }, 1);  // 1ms 延迟，更灵敏
-        });
+      if (g_token.load(std::memory_order_relaxed) <= 0) {
+        folly::futures::sleep(std::chrono::milliseconds(1))
+            .via(cpu_executor)
+            .thenTry([idx, send_request](folly::Try<folly::Unit>) {
+              (*send_request)(idx);
+            });
         return;
       }
-      g_token--;
+      g_token.fetch_sub(1, std::memory_order_relaxed);
     }
 
     if (g_stop.load(std::memory_order_acquire)) {
@@ -415,56 +391,64 @@ std::shared_ptr<BenchmarkState> run_benchmark(
 
     state->total_inflight.fetch_add(1, std::memory_order_relaxed);
 
+    auto on_response = [state, idx, send_request](int64_t send_time, int64_t recv_time, bool success) {
+      int64_t latency_us = recv_time - send_time;
+
+      int stats_idx = get_stats_idx();
+      ThreadStats& stats = *g_stats_per_cpu[stats_idx];
+
+      if (success) {
+        stats.latency.addValue(latency_us);
+        stats.success++;
+      } else {
+        stats.fail++;
+      }
+
+      uint64_t last = g_client_last_update_time.load(std::memory_order_relaxed);
+      if (recv_time > last && recv_time - last > 100000) {
+        if (g_client_last_update_time.compare_exchange_weak(
+                last, recv_time, std::memory_order_relaxed)) {
+          auto snap = util::g_snapshot.load(std::memory_order_acquire);
+          stats.client_cpu_usage.addValue(snap.cpu_percent);
+          stats.client_mem_usage.addValue(snap.mem_percent);
+        }
+      }
+
+      g_total_cnt.fetch_add(1, std::memory_order_relaxed);
+      state->total_inflight.fetch_sub(1, std::memory_order_relaxed);
+      auto processed = state->total_processed.fetch_add(1, std::memory_order_relaxed) + 1;
+
+      if (!g_stop.load(std::memory_order_acquire)) {
+        if (FLAGS_test_iterations > 0 &&
+            processed >= static_cast<uint64_t>(FLAGS_test_iterations)) {
+          g_stop.store(true, std::memory_order_release);
+        } else if (FLAGS_test_iterations == 0 &&
+                    recv_time - state->start_time >= FLAGS_test_seconds * 1000000LL) {
+          g_stop.store(true, std::memory_order_release);
+        } else {
+          (*send_request)(idx);
+        }
+      }
+    };
+
     if (state->is_native_mode) {
       int64_t send_time = monotonic_us();
-      ctx.client->semifuture_native_test(state->request)
+      std::get<std::unique_ptr<PerfTestClient>>(ctx.client)->semifuture_native_test(state->request)
           .via(cpu_executor)
-          .thenTry([state, idx, send_time, send_request](folly::Try<press_test::PerfTestResponse>&& t) {
+          .thenTry([state, idx, send_time, on_response](folly::Try<press_test::PerfTestResponse>&& t) {
             int64_t recv_time = monotonic_us();
-            int64_t latency_us = recv_time - send_time;
-
-            int stats_idx = get_stats_idx();
-            ThreadStats& stats = *g_stats_per_cpu[stats_idx];
-
-            if (t.hasValue()) {
-              stats.latency.addValue(latency_us);
-              stats.success++;
+            bool success = t.hasValue();
+            on_response(send_time, recv_time, success);
+            if (success) {
               if (t.value().cpu_usage().value() > 0) {
-                stats.server_cpu_usage.addValue(t.value().cpu_usage().value());
+                g_stats_per_cpu[get_stats_idx()]->server_cpu_usage.addValue(t.value().cpu_usage().value());
               }
               if (t.value().mem_usage().value() > 0) {
-                stats.server_mem_usage.addValue(t.value().mem_usage().value());
+                g_stats_per_cpu[get_stats_idx()]->server_mem_usage.addValue(t.value().mem_usage().value());
               }
               g_total_bytes.fetch_add(state->request.payload()->size(), std::memory_order_relaxed);
             } else {
-              stats.fail++;
               LOG(ERROR) << "RPC failed: " << t.exception().what();
-            }
-
-            uint64_t last = g_client_last_update_time.load(std::memory_order_relaxed);
-            if (recv_time > last && recv_time - last > 100000) {
-              if (g_client_last_update_time.compare_exchange_weak(
-                      last, recv_time, std::memory_order_relaxed)) {
-                auto snap = util::g_snapshot.load(std::memory_order_acquire);
-                stats.client_cpu_usage.addValue(snap.cpu_percent);
-                stats.client_mem_usage.addValue(snap.mem_percent);
-              }
-            }
-
-            g_total_cnt.fetch_add(1, std::memory_order_relaxed);
-            state->total_inflight.fetch_sub(1, std::memory_order_relaxed);
-            auto processed = state->total_processed.fetch_add(1, std::memory_order_relaxed) + 1;
-
-            if (!g_stop.load(std::memory_order_acquire)) {
-              if (FLAGS_test_iterations > 0 &&
-                  processed >= static_cast<uint64_t>(FLAGS_test_iterations)) {
-                g_stop.store(true, std::memory_order_release);
-              } else if (FLAGS_test_iterations == 0 &&
-                          recv_time - state->start_time > FLAGS_test_seconds * 1000000LL) {
-                g_stop.store(true, std::memory_order_release);
-              } else {
-                (*send_request)(idx); // 通过 shared_ptr 调用
-              }
             }
           });
     } else {
@@ -479,48 +463,16 @@ std::shared_ptr<BenchmarkState> run_benchmark(
       *univ_req.payload() = std::move(serialized);
 
       int64_t send_time = monotonic_us();
-      ctx.universal_client->semifuture_universal_test(univ_req)
+      std::get<std::unique_ptr<UniversalClient>>(ctx.client)->semifuture_universal_test(univ_req)
           .via(cpu_executor)
-          .thenTry([state, idx, send_time, send_request](folly::Try<universal::UniversalResponse>&& t) {
+          .thenTry([state, idx, send_time, on_response](folly::Try<universal::UniversalResponse>&& t) {
             int64_t recv_time = monotonic_us();
-            int64_t latency_us = recv_time - send_time;
-
-            int stats_idx = get_stats_idx();
-            ThreadStats& stats = *g_stats_per_cpu[stats_idx];
-
-            if (t.hasValue()) {
-              stats.latency.addValue(latency_us);
-              stats.success++;
-              state->serialization_handler->processResponse(*t.value().payload(), stats);
+            bool success = t.hasValue();
+            on_response(send_time, recv_time, success);
+            if (success) {
+              state->serialization_handler->processResponse(*t.value().payload(), *g_stats_per_cpu[get_stats_idx()]);
             } else {
-              stats.fail++;
               LOG(ERROR) << "RPC failed: " << t.exception().what();
-            }
-
-            uint64_t last = g_client_last_update_time.load(std::memory_order_relaxed);
-            if (recv_time > last && recv_time - last > 100000) {
-              if (g_client_last_update_time.compare_exchange_weak(
-                      last, recv_time, std::memory_order_relaxed)) {
-                auto snap = util::g_snapshot.load(std::memory_order_acquire);
-                stats.client_cpu_usage.addValue(snap.cpu_percent);
-                stats.client_mem_usage.addValue(snap.mem_percent);
-              }
-            }
-
-            g_total_cnt.fetch_add(1, std::memory_order_relaxed);
-            state->total_inflight.fetch_sub(1, std::memory_order_relaxed);
-            auto processed = state->total_processed.fetch_add(1, std::memory_order_relaxed) + 1;
-
-            if (!g_stop.load(std::memory_order_acquire)) {
-              if (FLAGS_test_iterations > 0 &&
-                  processed >= static_cast<uint64_t>(FLAGS_test_iterations)) {
-                g_stop.store(true, std::memory_order_release);
-              } else if (FLAGS_test_iterations == 0 &&
-                          recv_time - state->start_time > FLAGS_test_seconds * 1000000LL) {
-                g_stop.store(true, std::memory_order_release);
-              } else {
-                (*send_request)(idx);
-              }
             }
           });
     }
@@ -529,7 +481,7 @@ std::shared_ptr<BenchmarkState> run_benchmark(
   // Initialize: distribute queue_depth across all connections
   for (int i = 0; i < num_connections; ++i) {
     for (int j = 0; j < FLAGS_queue_depth; ++j) {
-      state->ctxs[i]->evb->runInEventBaseThread([i, send_request]() {
+      cpu_executor->add([i, send_request]() {
         (*send_request)(i);
       });
     }
@@ -567,10 +519,7 @@ void test_once(int payload_size) {
   g_total_bytes.store(0, std::memory_order_relaxed);
   g_total_cnt.store(0, std::memory_order_relaxed);
 
-  {
-    std::lock_guard<std::mutex> lock(g_token_mtx);
-    g_token = (FLAGS_expected_qps > 0) ? FLAGS_expected_qps : 0;
-  }
+  g_token.store(0, std::memory_order_relaxed);
 
   // Initialize per-CPU stats
   g_stats_per_cpu.clear();
@@ -645,7 +594,6 @@ void test_once(int payload_size) {
 
   // Signal stop to token thread
   g_stop.store(true, std::memory_order_release);
-  g_token_cv.notify_all();
   if (token_td.joinable()) {
     token_td.join();
   }
@@ -658,19 +606,13 @@ void test_once(int payload_size) {
   for (auto& ctx : state->ctxs) {
     folly::Baton<> baton;
     auto* evb = ctx->evb;
-    if (state->is_native_mode) {
-      auto client_ptr = ctx->client.release();
-      evb->runInEventBaseThread([client_ptr, &baton]() {
-        delete client_ptr;
+    std::visit([&](auto& client_ptr) {
+      auto* raw = client_ptr.release();
+      evb->runInEventBaseThread([raw, &baton]() {
+        delete raw;
         baton.post();
       });
-    } else {
-      auto client_ptr = ctx->universal_client.release();
-      evb->runInEventBaseThread([client_ptr, &baton]() {
-        delete client_ptr;
-        baton.post();
-      });
-    }
+    }, ctx->client);
     baton.wait();
   }
   state->ctxs.clear();
@@ -713,7 +655,7 @@ void test_once(int payload_size) {
   }
 
   uint64_t total_cnt = total_success + total_fail;
-  double throughput_mbps = (g_total_bytes.load() / 1048576.0) / elapsed_sec;
+  double throughput_mbps = (g_total_bytes.load() / 1024.0 / 1024.0) / elapsed_sec;
 
   LOG(INFO) << "====== Benchmark Results =======";
   LOG(INFO) << "Total duration: " << std::fixed << std::setprecision(3)

@@ -64,8 +64,11 @@ void initUnivStats(int num_threads) {
 static int get_univ_slot_idx() {
   if (g_univ_slot_idx < 0) {
     static std::atomic<int> next_idx{0};
-    g_univ_slot_idx = next_idx.fetch_add(1, std::memory_order_relaxed)
-                      % static_cast<int>(g_univ_stats_slots.size());
+    int idx = next_idx.fetch_add(1, std::memory_order_relaxed);
+    CHECK(idx < static_cast<int>(g_univ_stats_slots.size()))
+        << "More threads than stats slots: " << idx + 1
+        << " threads vs " << g_univ_stats_slots.size() << " slots";
+    g_univ_slot_idx = idx;
   }
   return g_univ_slot_idx;
 }
