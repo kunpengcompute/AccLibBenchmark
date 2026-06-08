@@ -1,5 +1,9 @@
 namespace cpp2 universal
 
+cpp_include "folly/io/IOBuf.h"
+
+typedef binary (cpp.type = "std::unique_ptr<folly::IOBuf>") IOBufPtr
+
 enum SerializationType {
     PROTOBUF = 1,
     SIMD_JSON = 2,
@@ -10,12 +14,12 @@ enum SerializationType {
 
 struct UniversalRequest {
     1: SerializationType type;
-    2: binary payload;
+    2: IOBufPtr payload;
 }
 
 struct UniversalResponse {
     1: SerializationType type;
-    2: binary payload;
+    2: IOBufPtr payload;
 }
 
 service UniversalService {

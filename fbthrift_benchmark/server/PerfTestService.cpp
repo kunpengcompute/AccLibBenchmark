@@ -2,6 +2,7 @@
 #include <iostream>
 #include <memory>
 #include <vector>
+#include <folly/io/IOBuf.h>
 #include "server/PerfTestService.h"
 #include "util/ResourceMonitor.h"
 #include "gen-cpp2/press.pb.h"
@@ -16,7 +17,7 @@ void PerfTestServiceHandler::native_test(PerfTestResponse &response,
                                   std::unique_ptr<Request> req)
 {
   if (*req->echo_attachment()) {
-    *response.payload() = *req->payload();
+    *response.payload() = std::move(*req->payload());
   }
 
   uint64_t last = g_last_resource_update_time.load(std::memory_order_relaxed);
@@ -102,11 +103,18 @@ void UniversalServiceHandler::universal_test(
   switch (*request->type()) {
     case SerializationType::PROTOBUF: {
       press_test_proto::Request pb_req;
+      std::string payload_str;
+      auto& req_payload = *request->payload();
+      if (req_payload) {
+        size_t len = req_payload->computeChainDataLength();
+        folly::io::Cursor cursor(req_payload.get());
+        payload_str = cursor.readFixedString(len);
+      }
       const auto deser_start  = std::chrono::steady_clock::now();
-      if (!pb_req.ParseFromString(*request->payload())) {
+      if (!pb_req.ParseFromString(payload_str)) {
         LOG(ERROR) << "Failed to parse protobuf request";
         *response.type() = SerializationType::PROTOBUF;
-        *response.payload() = std::string();
+        *response.payload() = nullptr;
         return;
       }
       const auto deser_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - deser_start ).count();
@@ -137,7 +145,8 @@ void UniversalServiceHandler::universal_test(
 
       *response.type() = SerializationType::PROTOBUF;
       const auto ser_start = std::chrono::steady_clock::now();
-      *response.payload() = pb_resp.SerializeAsString();
+      std::string ser_str = pb_resp.SerializeAsString();
+      *response.payload() = folly::IOBuf::copyBuffer(ser_str);
       const auto ser_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - ser_start).count();
       g_univ_stats_slots[get_univ_slot_idx()]->serialize.addValue(ser_us);
       break;
@@ -146,7 +155,7 @@ void UniversalServiceHandler::universal_test(
       LOG(ERROR) << "Unsupported serialization type: "
                  << static_cast<int>(*request->type());
       *response.type() = *request->type();
-      *response.payload() = std::string();
+      *response.payload() = nullptr;
       break;
     }
   }

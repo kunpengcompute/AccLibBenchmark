@@ -13,6 +13,7 @@
 #include <gflags/gflags.h>
 #include <folly/SocketAddress.h>
 #include <folly/init/Init.h>
+#include <folly/io/IOBuf.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
@@ -218,7 +219,7 @@ static int get_stats_idx() {
 struct SerializationHandler {
   virtual ~SerializationHandler() = default;
   virtual std::string serialize(const std::string& payload, bool echo_attachment) = 0;
-  virtual void processResponse(const std::string& payload, ThreadStats& stats) = 0;
+  virtual void processResponse(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) = 0;
   virtual universal::SerializationType getType() const = 0;
 };
 
@@ -230,10 +231,16 @@ struct ProtobufHandler : SerializationHandler {
     return req.SerializeAsString();
   }
 
-  void processResponse(const std::string& payload, ThreadStats& stats) override {
+  void processResponse(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) override {
     press_test_proto::PerfTestResponse resp;
+    std::string payload_str;
+    if (payload) {
+      size_t len = payload->computeChainDataLength();
+      folly::io::Cursor cursor(payload.get());
+      payload_str = cursor.readFixedString(len);
+    }
     const auto deser_start = std::chrono::steady_clock::now();
-    if (resp.ParseFromString(payload)) {
+    if (resp.ParseFromString(payload_str)) {
       stats.universal_deserialize.addValue(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now() - deser_start).count());
       try {
@@ -261,7 +268,7 @@ struct SimdJsonHandler : SerializationHandler {
     return "";
   }
 
-  void processResponse(const std::string& payload, ThreadStats& stats) override {
+  void processResponse(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) override {
     LOG(FATAL) << "SimdJson deserialization not implemented yet";
   }
 
@@ -355,7 +362,7 @@ std::shared_ptr<BenchmarkState> run_benchmark(
   }
 
   state->request.echo_attachment() = FLAGS_echo_attachment;
-  state->request.payload() = payload;
+  state->request.payload() = folly::IOBuf::copyBuffer(payload);
   state->start_time = monotonic_us();
 
   // ========================================================================
@@ -446,21 +453,31 @@ std::shared_ptr<BenchmarkState> run_benchmark(
               if (t.value().mem_usage().value() > 0) {
                 g_stats_per_cpu[get_stats_idx()]->server_mem_usage.addValue(t.value().mem_usage().value());
               }
-              g_total_bytes.fetch_add(state->request.payload()->size(), std::memory_order_relaxed);
+              auto& resp_payload = *t.value().payload();
+              if (resp_payload) {
+                g_total_bytes.fetch_add(resp_payload->computeChainDataLength(), std::memory_order_relaxed);
+              }
             } else {
               LOG(ERROR) << "RPC failed: " << t.exception().what();
             }
           });
     } else {
       int64_t serialize_start = monotonic_us();
+      std::string payload_input;
+      auto& req_payload = *state->request.payload();
+      if (req_payload) {
+        size_t len = req_payload->computeChainDataLength();
+        folly::io::Cursor cursor(req_payload.get());
+        payload_input = cursor.readFixedString(len);
+      }
       std::string serialized = state->serialization_handler->serialize(
-          *state->request.payload(), *state->request.echo_attachment());
+          payload_input, *state->request.echo_attachment());
       int64_t univ_serialize_us = monotonic_us() - serialize_start;
       g_stats_per_cpu[get_stats_idx()]->universal_serialize.addValue(univ_serialize_us);
 
       universal::UniversalRequest univ_req;
       univ_req.type() = state->serialization_handler->getType();
-      *univ_req.payload() = std::move(serialized);
+      *univ_req.payload() = folly::IOBuf::copyBuffer(serialized);
 
       int64_t send_time = monotonic_us();
       std::get<std::unique_ptr<UniversalClient>>(ctx.client)->semifuture_universal_test(univ_req)
