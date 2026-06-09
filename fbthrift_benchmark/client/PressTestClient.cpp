@@ -28,6 +28,7 @@
 #include "gen-cpp2/press.pb.h"
 #include "util/LatencyStats.h"
 #include "util/ResourceMonitor.h"
+#include "IOBufZeroCopyStream.h"
 
 DEFINE_string(host, "127.0.0.1", "Server host");
 DEFINE_int32(port, 8002, "Server port");
@@ -218,42 +219,43 @@ static int get_stats_idx() {
 // ============ Serialization Handler (for universal mode) ============
 struct SerializationHandler {
   virtual ~SerializationHandler() = default;
-  virtual std::string serialize(const std::string& payload, bool echo_attachment) = 0;
+  virtual std::unique_ptr<folly::IOBuf> serialize(const std::string& payload, bool echo_attachment) = 0;
   virtual void processResponse(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) = 0;
   virtual universal::SerializationType getType() const = 0;
 };
 
 struct ProtobufHandler : SerializationHandler {
-  std::string serialize(const std::string& payload, bool echo_attachment) override {
+  std::unique_ptr<folly::IOBuf> serialize(const std::string& payload, bool echo_attachment) override {
     press_test_proto::Request req;
     req.set_echo_attachment(echo_attachment);
     req.set_payload(payload);
-    return req.SerializeAsString();
+    size_t size_hint = req.ByteSizeLong();
+    folly::IOBufQueue queue;
+    press_test::IOBufAsZeroCopyOutputStream stream(&queue, size_hint);
+    req.SerializeToZeroCopyStream(&stream);
+    return queue.move();
   }
 
   void processResponse(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) override {
     press_test_proto::PerfTestResponse resp;
-    std::string payload_str;
-    if (payload) {
-      size_t len = payload->computeChainDataLength();
-      folly::io::Cursor cursor(payload.get());
-      payload_str = cursor.readFixedString(len);
-    }
     const auto deser_start = std::chrono::steady_clock::now();
-    if (resp.ParseFromString(payload_str)) {
-      stats.universal_deserialize.addValue(std::chrono::duration_cast<std::chrono::microseconds>(
-        std::chrono::steady_clock::now() - deser_start).count());
-      try {
-        double cpu_val = std::stod(resp.cpu_usage());
-        if (cpu_val > 0) {
-          stats.server_cpu_usage.addValue(cpu_val);
-        }
-        double mem_val = std::stod(resp.mem_usage());
-        if (mem_val > 0) {
-          stats.server_mem_usage.addValue(mem_val);
-        }
-      } catch (...) {}
-      g_total_bytes.fetch_add(resp.payload().size(), std::memory_order_relaxed);
+    if (payload) {
+      press_test::IOBufAsZeroCopyInputStream stream(payload.get());
+      if (resp.ParseFromZeroCopyStream(&stream)) {
+        stats.universal_deserialize.addValue(std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - deser_start).count());
+        try {
+          double cpu_val = std::stod(resp.cpu_usage());
+          if (cpu_val > 0) {
+            stats.server_cpu_usage.addValue(cpu_val);
+          }
+          double mem_val = std::stod(resp.mem_usage());
+          if (mem_val > 0) {
+            stats.server_mem_usage.addValue(mem_val);
+          }
+        } catch (...) {}
+        g_total_bytes.fetch_add(resp.payload().size(), std::memory_order_relaxed);
+      }
     }
   }
 
@@ -263,9 +265,9 @@ struct ProtobufHandler : SerializationHandler {
 };
 
 struct SimdJsonHandler : SerializationHandler {
-  std::string serialize(const std::string& payload, bool echo_attachment) override {
+  std::unique_ptr<folly::IOBuf> serialize(const std::string& payload, bool echo_attachment) override {
     LOG(FATAL) << "SimdJson serialization not implemented yet";
-    return "";
+    return nullptr;
   }
 
   void processResponse(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) override {
@@ -466,18 +468,22 @@ std::shared_ptr<BenchmarkState> run_benchmark(
       std::string payload_input;
       auto& req_payload = *state->request.payload();
       if (req_payload) {
-        size_t len = req_payload->computeChainDataLength();
-        folly::io::Cursor cursor(req_payload.get());
-        payload_input = cursor.readFixedString(len);
+        if (!req_payload->isChained()) {
+          payload_input.assign(reinterpret_cast<const char*>(req_payload->data()),
+                               req_payload->length());
+        } else {
+          folly::io::Cursor cursor(req_payload.get());
+          payload_input = cursor.readFixedString(req_payload->computeChainDataLength());
+        }
       }
-      std::string serialized = state->serialization_handler->serialize(
+      std::unique_ptr<folly::IOBuf> serialized = state->serialization_handler->serialize(
           payload_input, *state->request.echo_attachment());
       int64_t univ_serialize_us = monotonic_us() - serialize_start;
       g_stats_per_cpu[get_stats_idx()]->universal_serialize.addValue(univ_serialize_us);
 
       universal::UniversalRequest univ_req;
       univ_req.type() = state->serialization_handler->getType();
-      *univ_req.payload() = folly::IOBuf::copyBuffer(serialized);
+      *univ_req.payload() = std::move(serialized);
 
       int64_t send_time = monotonic_us();
       std::get<std::unique_ptr<UniversalClient>>(ctx.client)->semifuture_universal_test(univ_req)

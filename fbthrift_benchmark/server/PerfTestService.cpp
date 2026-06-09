@@ -4,6 +4,7 @@
 #include <vector>
 #include <folly/io/IOBuf.h>
 #include "server/PerfTestService.h"
+#include "IOBufZeroCopyStream.h"
 #include "util/ResourceMonitor.h"
 #include "gen-cpp2/press.pb.h"
 
@@ -103,16 +104,17 @@ void UniversalServiceHandler::universal_test(
   switch (*request->type()) {
     case SerializationType::PROTOBUF: {
       press_test_proto::Request pb_req;
-      std::string payload_str;
       auto& req_payload = *request->payload();
-      if (req_payload) {
-        size_t len = req_payload->computeChainDataLength();
-        folly::io::Cursor cursor(req_payload.get());
-        payload_str = cursor.readFixedString(len);
-      }
       const auto deser_start  = std::chrono::steady_clock::now();
-      if (!pb_req.ParseFromString(payload_str)) {
-        LOG(ERROR) << "Failed to parse protobuf request";
+      if (req_payload) {
+        press_test::IOBufAsZeroCopyInputStream stream(req_payload.get());
+        if (!pb_req.ParseFromZeroCopyStream(&stream)) {
+          LOG(ERROR) << "Failed to parse protobuf request";
+          *response.type() = SerializationType::PROTOBUF;
+          *response.payload() = nullptr;
+          return;
+        }
+      } else {
         *response.type() = SerializationType::PROTOBUF;
         *response.payload() = nullptr;
         return;
@@ -122,7 +124,7 @@ void UniversalServiceHandler::universal_test(
 
       press_test_proto::PerfTestResponse pb_resp;
       if (pb_req.echo_attachment()) {
-        pb_resp.set_payload(pb_req.payload());
+        pb_resp.set_payload(std::move(*pb_req.release_payload()));
       }
 
       uint64_t last = g_last_resource_update_time.load(std::memory_order_relaxed);
@@ -145,8 +147,11 @@ void UniversalServiceHandler::universal_test(
 
       *response.type() = SerializationType::PROTOBUF;
       const auto ser_start = std::chrono::steady_clock::now();
-      std::string ser_str = pb_resp.SerializeAsString();
-      *response.payload() = folly::IOBuf::copyBuffer(ser_str);
+      size_t size_hint = pb_resp.ByteSizeLong();
+      folly::IOBufQueue queue;
+      press_test::IOBufAsZeroCopyOutputStream stream(&queue, size_hint);
+      pb_resp.SerializeToZeroCopyStream(&stream);
+      *response.payload() = queue.move();
       const auto ser_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - ser_start).count();
       g_univ_stats_slots[get_univ_slot_idx()]->serialize.addValue(ser_us);
       break;
