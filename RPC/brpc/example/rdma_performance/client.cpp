@@ -34,6 +34,7 @@
 #include "bvar/latency_recorder.h"
 #include "bvar/variable.h"
 #include <fstream>
+#include <dirent.h>
 #include "press.pb.h"
 
 DEFINE_int32(thread_num, 0, "How many threads are used");
@@ -53,8 +54,10 @@ DEFINE_int32(dummy_port, 8001, "Dummy server port number");
 DEFINE_string(request_compress_type, "none",
               "Compression algorithm for request protobuf body: none/snappy/gzip/zlib");
 DEFINE_string(payload_mode, "message",
-              "Where benchmark payload is carried: message or attachment");
+              "Where benchmark payload is carried: message, attachment, or json");
 DEFINE_string(data_file, "./request_data.pb", "Path to the pre-generated pb data");
+DEFINE_string(json_data_dir, "",
+              "Directory containing JSON test data files for json payload mode");
 
 bvar::LatencyRecorder g_latency_recorder("client");
 bvar::LatencyRecorder g_server_cpu_recorder("server_cpu");
@@ -66,6 +69,10 @@ butil::atomic<int64_t> g_server_request_decompress_avg_ns;
 butil::atomic<int64_t> g_server_request_decompress_p99_ns;
 butil::atomic<int64_t> g_server_response_compress_avg_ns;
 butil::atomic<int64_t> g_server_response_compress_p99_ns;
+butil::atomic<int64_t> g_json_parse_avg_ns;
+butil::atomic<int64_t> g_json_parse_p99_ns;
+butil::atomic<int64_t> g_json_serialize_avg_ns;
+butil::atomic<int64_t> g_json_serialize_p99_ns;
 std::vector<std::string> g_servers;
 int rr_index = 0;
 volatile bool g_stop = false;
@@ -76,11 +83,13 @@ butil::atomic<int64_t> g_token(10000);
 enum PayloadMode {
     PAYLOAD_MODE_MESSAGE = 0,
     PAYLOAD_MODE_ATTACHMENT = 1,
+    PAYLOAD_MODE_JSON = 2,
 };
 
 PayloadMode g_payload_mode = PAYLOAD_MODE_MESSAGE;
 std::string g_global_payload;
 std::vector<press_test::Request> g_pregenerated_requests;
+std::vector<std::string> g_json_payloads;
 butil::atomic<size_t> g_request_idx(0);
 
 int LoadTestData() {
@@ -95,7 +104,7 @@ int LoadTestData() {
     for (int i = 0; i < collection.requests_size(); ++i) {
         press_test::Request& req = *collection.mutable_requests(i);
         req.set_echo_attachment(FLAGS_echo_attachment);
-        
+
         if (g_payload_mode == PAYLOAD_MODE_MESSAGE) {
             req.set_payload(g_global_payload);
         } else {
@@ -104,6 +113,47 @@ int LoadTestData() {
         g_pregenerated_requests.push_back(req);
     }
     return g_pregenerated_requests.empty() ? -1 : 0;
+}
+
+int LoadJsonData() {
+    if (FLAGS_json_data_dir.empty()) {
+        LOG(ERROR) << "json_data_dir is not specified for json payload mode";
+        return -1;
+    }
+    DIR* dir = opendir(FLAGS_json_data_dir.c_str());
+    if (!dir) {
+        LOG(ERROR) << "Failed to open json_data_dir: " << FLAGS_json_data_dir;
+        return -1;
+    }
+    struct dirent* entry;
+    std::vector<std::string> json_files;
+    while ((entry = readdir(dir)) != nullptr) {
+        std::string name = entry->d_name;
+        if (name.size() >= 5 && name.substr(name.size() - 5) == ".json") {
+            json_files.push_back(FLAGS_json_data_dir + "/" + name);
+        }
+    }
+    closedir(dir);
+    std::sort(json_files.begin(), json_files.end());
+    for (size_t i = 0; i < json_files.size(); ++i) {
+        const std::string& filepath = json_files[i];
+        std::ifstream ifs(filepath, std::ios::binary);
+        if (ifs) {
+            std::string content((std::istreambuf_iterator<char>(ifs)),
+                                std::istreambuf_iterator<char>());
+            if (!content.empty()) {
+                g_json_payloads.push_back(std::move(content));
+                LOG(INFO) << "Loaded JSON file: " << filepath
+                          << " (" << g_json_payloads.back().size() << " bytes)";
+            }
+        }
+    }
+    if (g_json_payloads.empty()) {
+        LOG(ERROR) << "No JSON files found in " << FLAGS_json_data_dir;
+        return -1;
+    }
+    LOG(INFO) << "Loaded " << g_json_payloads.size() << " JSON files";
+    return 0;
 }
 
 std::string ToLower(std::string value) {
@@ -162,8 +212,12 @@ bool ParsePayloadMode(const std::string& mode, PayloadMode* payload_mode) {
         *payload_mode = PAYLOAD_MODE_ATTACHMENT;
         return true;
     }
+    if (normalized == "json") {
+        *payload_mode = PAYLOAD_MODE_JSON;
+        return true;
+    }
     LOG(ERROR) << "Unknown payload_mode=`" << mode
-               << "`, supported values: message/attachment";
+               << "`, supported values: message/attachment/json";
     return false;
 }
 
@@ -225,6 +279,10 @@ public:
         request.set_echo_attachment(_echo_attachment);
         if (g_payload_mode == PAYLOAD_MODE_MESSAGE) {
             request.set_payload(_payload);
+        } else if (g_payload_mode == PAYLOAD_MODE_JSON) {
+            if (!g_json_payloads.empty()) {
+                request.set_payload(g_json_payloads[0]);
+            }
         } else {
             cntl.request_attachment().append(_attachment);
         }
@@ -241,6 +299,7 @@ public:
         brpc::Controller* cntl;
         press_test::PerfTestResponse* resp;
         PerformanceTest* test;
+        size_t request_bytes;
     };
 
     void SendRequest() {
@@ -253,14 +312,28 @@ public:
         RespClosure* closure = new RespClosure;
         closure->resp = new press_test::PerfTestResponse();
         closure->cntl = new brpc::Controller();
+        closure->request_bytes = _payload_size;
         closure->cntl->set_request_compress_type(g_request_compress_type);
 
-        size_t idx = g_request_idx.fetch_add(1, butil::memory_order_relaxed) % g_pregenerated_requests.size();
-        const press_test::Request& request = g_pregenerated_requests[idx];
-        
-        if (g_payload_mode == PAYLOAD_MODE_ATTACHMENT) {
-        closure->cntl->request_attachment().append(_attachment);
+        press_test::Request request;
+        request.set_echo_attachment(FLAGS_echo_attachment);
+
+        if (g_payload_mode == PAYLOAD_MODE_JSON) {
+            size_t idx = g_request_idx.fetch_add(1, butil::memory_order_relaxed)
+                         % g_json_payloads.size();
+            request.set_payload(g_json_payloads[idx]);
+            closure->request_bytes = request.payload().size();
+        } else if (g_payload_mode == PAYLOAD_MODE_MESSAGE) {
+            size_t idx = g_request_idx.fetch_add(1, butil::memory_order_relaxed)
+                         % g_pregenerated_requests.size();
+            request = g_pregenerated_requests[idx];
+        } else {
+            size_t idx = g_request_idx.fetch_add(1, butil::memory_order_relaxed)
+                         % g_pregenerated_requests.size();
+            request = g_pregenerated_requests[idx];
+            closure->cntl->request_attachment().append(_attachment);
         }
+
         closure->test = this;
         google::protobuf::Closure* done = brpc::NewCallback(&HandleResponse, closure);
         press_test::PerfTestService_Stub stub(_channel);
@@ -268,6 +341,7 @@ public:
     }
 
     static void HandleResponse(RespClosure* closure) {
+        std::unique_ptr<RespClosure> closure_guard(closure);
         std::unique_ptr<brpc::Controller> cntl_guard(closure->cntl);
         std::unique_ptr<press_test::PerfTestResponse> response_guard(closure->resp);
         if (closure->cntl->Failed()) {
@@ -292,11 +366,20 @@ public:
         g_server_response_compress_p99_ns.store(
             closure->resp->server_response_compress_p99_ns(),
             butil::memory_order_relaxed);
-        g_total_bytes.fetch_add(closure->test->_payload_size, butil::memory_order_relaxed);
+        g_json_parse_avg_ns.store(
+            closure->resp->json_parse_avg_ns(),
+            butil::memory_order_relaxed);
+        g_json_parse_p99_ns.store(
+            closure->resp->json_parse_p99_ns(),
+            butil::memory_order_relaxed);
+        g_json_serialize_avg_ns.store(
+            closure->resp->json_serialize_avg_ns(),
+            butil::memory_order_relaxed);
+        g_json_serialize_p99_ns.store(
+            closure->resp->json_serialize_p99_ns(),
+            butil::memory_order_relaxed);
+        g_total_bytes.fetch_add(closure->request_bytes, butil::memory_order_relaxed);
         g_total_cnt.fetch_add(1, butil::memory_order_relaxed);
-
-        cntl_guard.reset(NULL);
-        response_guard.reset(NULL);
 
         if (closure->test->_iterations == 0 && FLAGS_test_iterations > 0) {
             closure->test->_stop = true;
@@ -307,7 +390,7 @@ public:
         uint64_t now = butil::gettimeofday_us();
         if (now > last && now - last > 100000) {
             if (g_last_time.exchange(now, butil::memory_order_relaxed) == last) {
-                g_client_cpu_recorder << 
+                g_client_cpu_recorder <<
                     atof(bvar::Variable::describe_exposed("process_cpu_usage").c_str()) * 100;
             }
         }
@@ -322,7 +405,7 @@ public:
         PerformanceTest* test = (PerformanceTest*)arg;
         test->_start_time = butil::gettimeofday_us();
         test->_iterations = FLAGS_test_iterations;
-        
+
         for (int i = 0; i < FLAGS_queue_depth; ++i) {
             test->SendRequest();
         }
@@ -352,7 +435,8 @@ void Test(int thread_num, int attachment_size) {
         << ", Depth: " << FLAGS_queue_depth
         << ", Attachment: " << attachment_size << "B"
         << ", RDMA: " << (FLAGS_use_rdma ? "yes" : "no")
-        << ", PayloadMode: " << (g_payload_mode == PAYLOAD_MODE_MESSAGE ? "message" : "attachment")
+        << ", PayloadMode: " << (g_payload_mode == PAYLOAD_MODE_MESSAGE ? "message" :
+                                  g_payload_mode == PAYLOAD_MODE_ATTACHMENT ? "attachment" : "json")
         << ", RequestCompress: " << brpc::CompressTypeToCStr(g_request_compress_type)
         << ", Echo: " << (FLAGS_echo_attachment ? "yes]" : "no]")
         << std::endl;
@@ -362,6 +446,10 @@ void Test(int thread_num, int attachment_size) {
     g_server_request_decompress_p99_ns.store(0, butil::memory_order_relaxed);
     g_server_response_compress_avg_ns.store(0, butil::memory_order_relaxed);
     g_server_response_compress_p99_ns.store(0, butil::memory_order_relaxed);
+    g_json_parse_avg_ns.store(0, butil::memory_order_relaxed);
+    g_json_parse_p99_ns.store(0, butil::memory_order_relaxed);
+    g_json_serialize_avg_ns.store(0, butil::memory_order_relaxed);
+    g_json_serialize_p99_ns.store(0, butil::memory_order_relaxed);
     std::vector<PerformanceTest*> tests;
     for (int k = 0; k < thread_num; ++k) {
         PerformanceTest* t = new PerformanceTest(attachment_size, FLAGS_echo_attachment);
@@ -417,8 +505,18 @@ void Test(int thread_num, int attachment_size) {
             << ", ServerResponseCompressP99: "
             << g_server_response_compress_p99_ns.load(butil::memory_order_relaxed) << "ns"
             << ", ClientResponseDecompressAvg: " << client_response_decompress_avg_ns << "ns"
-            << ", ClientResponseDecompressP99: " << client_response_decompress_p99_ns << "ns"
-            << std::endl;
+            << ", ClientResponseDecompressP99: " << client_response_decompress_p99_ns << "ns";
+        if (g_payload_mode == PAYLOAD_MODE_JSON) {
+            std::cout << ", JsonParseAvg: "
+                << g_json_parse_avg_ns.load(butil::memory_order_relaxed) << "ns"
+                << ", JsonParseP99: "
+                << g_json_parse_p99_ns.load(butil::memory_order_relaxed) << "ns"
+                << ", JsonSerializeAvg: "
+                << g_json_serialize_avg_ns.load(butil::memory_order_relaxed) << "ns"
+                << ", JsonSerializeP99: "
+                << g_json_serialize_p99_ns.load(butil::memory_order_relaxed) << "ns";
+        }
+        std::cout << std::endl;
     } else {
         std::cout << " Throughput: " << throughput << "MB/s" << std::endl;
     }
@@ -449,12 +547,16 @@ int main(int argc, char* argv[]) {
         return -1;
     }
 
-    if (LoadTestData() != 0) {
+    if (g_payload_mode == PAYLOAD_MODE_JSON) {
+        if (LoadJsonData() != 0) {
+            LOG(ERROR) << "Failed to load JSON test data";
+            return -1;
+        }
+    } else if (LoadTestData() != 0) {
         LOG(ERROR) << "Failed to load test data";
         return -1;
     }
 
-    // Initialize RDMA environment in advance.
     if (FLAGS_use_rdma) {
         brpc::rdma::GlobalRdmaInitializeOrDie();
     }
