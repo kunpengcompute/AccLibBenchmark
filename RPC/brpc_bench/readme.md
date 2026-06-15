@@ -111,6 +111,7 @@ Payload 模式说明：
 - `payload_format=attachment`：使用 protobuf stub 调用 `PerfTestService::Test`，payload 放在 brpc attachment 中。
 - `payload_format=raw_json`：不使用 protobuf stub；client 使用 `Channel::CallMethod(NULL, ...)` 发 HTTP/H2 POST，请求 body 直接放 JSON 字符串。
 - raw JSON 只支持 `--protocol=http` 或 `--protocol=h2`，不支持 `baidu_std`。
+- 该 raw JSON 模式不同于 `RPC/brpc/example/rdma_performance --payload_mode=json`：这里的 JSON 是 HTTP/H2 body；后者是把 JSON 文本放进 protobuf `bytes payload` 字段，再由 server 业务代码可选地调用 sonic/rapidjson 解析。
 - `response_mode=minimal` 只支持 `payload_format=attachment`。该模式仍走 brpc 正常 RPC response meta，但 client 不分配/解析 `PerfTestResponse`，server 也不采样 CPU 字符串。
 
 ### 3.4 负载模型参数

@@ -1,5 +1,5 @@
 syntax = "proto3";
-package press_test; 
+package press_test;
 
 option cc_enable_arenas = true;
 option cc_generic_services = true;
@@ -9,7 +9,7 @@ message Request {
     repeated ValueMap ad_feat = 2;
     repeated ValueMap labels = 3;
     bool echo_attachment = 4;
-    bytes payload = 5; // 兼容原代码中的 payload 逻辑
+    bytes payload = 5;
 }
 
 message Value {
@@ -45,6 +45,10 @@ message PerfTestResponse {
     int64 server_request_decompress_p99_ns = 4;
     int64 server_response_compress_avg_ns = 5;
     int64 server_response_compress_p99_ns = 6;
+    int64 json_parse_avg_ns = 7;
+    int64 json_parse_p99_ns = 8;
+    int64 json_serialize_avg_ns = 9;
+    int64 json_serialize_p99_ns = 10;
 }
 
 service PerfTestService {
