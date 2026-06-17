@@ -820,6 +820,11 @@ void test_once(int payload_size) {
 int main(int argc, char* argv[]) {
   FLAGS_logtostderr = true;
   const folly::Init init(&argc, &argv);
+
+  if (FLAGS_mode != "native" && FLAGS_mode != "universal") {
+    LOG(FATAL) << "Unknown mode: " << FLAGS_mode << ", supported modes: native, universal";
+  }
+
   util::init_resource_collector();
 
   if (FLAGS_payload_size >= 0) {

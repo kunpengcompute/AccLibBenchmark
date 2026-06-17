@@ -10,8 +10,8 @@
 #include "server/PerfTestService.h"
 #include "util/ResourceMonitor.h"
 
-DEFINE_int32(port, 8002, "TCP Port of NativeService (PerfTestService)");
-DEFINE_int32(universal_port, 8003, "TCP Port of UniversalService");
+DEFINE_int32(port, 8002, "TCP Port of Server");
+DEFINE_string(mode, "native", "Server mode: native, universal");
 DEFINE_int32(num_io_threads, 1, "Number of IO worker threads");
 DEFINE_int32(num_cpu_threads, 1, "Number of CPU worker threads");
 
@@ -21,7 +21,6 @@ using press_test::PerfTestServiceHandler;
 using universal::UniversalServiceHandler;
 
 std::shared_ptr<ThriftServer> g_server;
-std::shared_ptr<ThriftServer> g_universal_server;
 std::atomic<bool> g_stop_requested{false};
 
 void printHeaderCompressionStats(){
@@ -116,9 +115,6 @@ void signalHandler(int sig) {
     if (g_server) {
       g_server->stop();
     }
-    if (g_universal_server) {
-      g_universal_server->stop();
-    }
   }
 }
 
@@ -149,26 +145,23 @@ int main(int argc, char** argv) {
 
   universal::initUnivStats(FLAGS_num_cpu_threads);
 
-  g_server = newServer<PerfTestServiceHandler>(FLAGS_port, FLAGS_num_io_threads, FLAGS_num_cpu_threads);
-  g_universal_server = newServer<UniversalServiceHandler>(FLAGS_universal_port, FLAGS_num_io_threads, FLAGS_num_cpu_threads);
+  if (FLAGS_mode == "native") {
+    g_server = newServer<PerfTestServiceHandler>(FLAGS_port, FLAGS_num_io_threads, FLAGS_num_cpu_threads);
+  } else if (FLAGS_mode == "universal") {
+    g_server = newServer<UniversalServiceHandler>(FLAGS_port, FLAGS_num_io_threads, FLAGS_num_cpu_threads);
+  } else {
+    LOG(ERROR) << "Unknown mode: " << FLAGS_mode << ", supported modes: native, universal";
+    return 1;
+  }
 
   signal(SIGINT, signalHandler);
   signal(SIGTERM, signalHandler);
 
-  LOG(INFO) << "PerfTest Server running on port: " << FLAGS_port
+  LOG(INFO) << FLAGS_mode << " Server running on port: " << FLAGS_port
             << " with " << FLAGS_num_io_threads << " IO threads and "
             << FLAGS_num_cpu_threads << " CPU threads";
-  LOG(INFO) << "Universal Server running on port: " << FLAGS_universal_port
-            << " with " << FLAGS_num_io_threads << " IO threads and "
-            << FLAGS_num_cpu_threads << " CPU threads";
-
-  std::thread universal_td([&]() {
-    g_universal_server->serve();
-  });
 
   g_server->serve();
-
-  universal_td.join();
 
   LOG(INFO) << "Server exited gracefully.";
   return 0;
