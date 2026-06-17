@@ -1,0 +1,6 @@
+syntax = "proto3";
+package pb.test;
+
+message ScalarSInt64 {
+    repeated sint64 numbers = 1 [packed=false];
+}

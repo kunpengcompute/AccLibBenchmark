@@ -1,0 +1,6 @@
+syntax = "proto3";
+package pb.test;
+
+message ScalarFloat {
+    repeated float numbers = 1 [packed=false];
+}

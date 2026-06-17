@@ -1,6 +1,0 @@
-syntax = "proto3";
-package pb.test;
-
-message ArrDouble {
-    repeated double numbers = 1 [packed=true];
-}

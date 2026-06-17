@@ -8,16 +8,93 @@
 #include <string>
 #include <vector>
 
-#include "arr_data32.pb.h"
-#include "arr_data64.pb.h"
-#include "arr_double.pb.h"
-#include "arr_fixed32.pb.h"
-#include "arr_fixed64.pb.h"
-#include "arr_float.pb.h"
-#include "arr_sfixed32.pb.h"
-#include "arr_sfixed64.pb.h"
+#include "scalar_int32.pb.h"
+#include "scalar_uint32.pb.h"
+#include "scalar_sint32.pb.h"
+#include "scalar_int64.pb.h"
+#include "scalar_uint64.pb.h"
+#include "scalar_sint64.pb.h"
+#include "scalar_bool.pb.h"
+#include "scalar_enum.pb.h"
+#include "scalar_double.pb.h"
+#include "scalar_float.pb.h"
+#include "repeated_int32.pb.h"
+#include "repeated_uint32.pb.h"
+#include "repeated_sint32.pb.h"
+#include "repeated_int64.pb.h"
+#include "repeated_uint64.pb.h"
+#include "repeated_sint64.pb.h"
+#include "repeated_double.pb.h"
+#include "repeated_float.pb.h"
+#include "bytes_data.pb.h"
 #include "string.pb.h"
 
+enum class Scene { kPureAscii = 0, kChinese = 1, kMixed = 2 };
+
+inline std::string GenerateFlexibleData(std::size_t target_size, Scene scene) {
+    std::string result;
+    result.reserve(target_size);
+
+    std::mt19937 gen(42);
+
+    // Chinese common characters pool (常用汉字)
+    std::vector<std::string> chinese_chars = {
+        "的", "一", "是", "在", "不", "了", "有", "和", "人", "这",
+        "中", "大", "为", "上", "个", "国", "我", "以", "要", "他",
+        "时", "来", "用", "们", "生", "到", "作", "地", "于", "出",
+        "就", "分", "对", "成", "会", "可", "主", "发", "年", "动",
+        "同", "工", "也", "能", "下", "过", "子", "说", "产", "种",
+        "面", "而", "方", "后", "多", "定", "行", "学", "法", "所",
+        "民", "得", "经", "十", "三", "之", "进", "着", "等", "部",
+        "度", "家", "电", "力", "里", "如", "水", "化", "高", "自",
+        "二", "理", "起", "小", "物", "现", "实", "加", "量", "都",
+        "两", "体", "制", "机", "当", "使", "点", "从", "业", "本"
+    };
+
+    float ascii_ratio = (scene == Scene::kPureAscii) ? 1.0f :
+                        (scene == Scene::kChinese)  ? 0.0f : 0.5f;
+
+    std::uniform_real_distribution<float> dist(0.0, 1.0);
+
+    while (result.size() < target_size) {
+        if (dist(gen) < ascii_ratio) {
+            result.push_back(static_cast<char>(gen() % 128));
+        } else {
+            const std::string &sample = chinese_chars[gen() % chinese_chars.size()];
+            if (result.size() + sample.size() <= target_size) {
+                result.append(sample);
+            } else {
+                result.push_back(' ');
+            }
+        }
+    }
+    return result;
+}
+
+// String data generator - one-step function
+inline pb::test::Person makeStringData(std::size_t size, Scene scene) {
+    std::string content = GenerateFlexibleData(size, scene);
+    pb::test::Person person;
+    person.set_email(content);
+    return person;
+}
+
+// Bytes data generator - one-step function
+inline pb::test::BytesData makeBytesData(std::size_t size) {
+    pb::test::BytesData data;
+    std::mt19937 gen(42);
+    std::uniform_int_distribution<uint8_t> dist(0, 255);
+
+    std::string bytes;
+    bytes.reserve(size);
+    for (std::size_t i = 0; i < size; ++i) {
+        bytes.push_back(static_cast<char>(dist(gen)));
+    }
+    data.add_data(bytes);
+    return data;
+}
+
+// Generate integer uniformly distributed by varint byte count
 inline std::uint64_t genIntRandomUniformBytes(std::uint8_t maxByteNum) {
     static std::random_device rd;
     static std::mt19937 engine(rd());
@@ -38,380 +115,189 @@ inline std::uint64_t genIntRandomUniformBytes(std::uint8_t maxByteNum) {
     return valDist(engine);
 }
 
-inline pb::test::ArrDouble genFullRangeDoubleData(std::size_t arrSize) {
-    static std::random_device rd;
-    static std::mt19937 engine(rd());
+// Scalar type generators (packed=false)
+
+inline pb::test::ScalarInt32 genScalarInt32(std::size_t count) {
+    pb::test::ScalarInt32 data;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint64_t n = genIntRandomUniformBytes(5);
+        data.add_numbers(static_cast<int32_t>(std::min(n, static_cast<std::uint64_t>(std::numeric_limits<int32_t>::max()))));
+    }
+    return data;
+}
+
+inline pb::test::ScalarUInt32 genScalarUInt32(std::size_t count) {
+    pb::test::ScalarUInt32 data;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint64_t n = genIntRandomUniformBytes(5);
+        data.add_numbers(static_cast<uint32_t>(std::min(n, static_cast<std::uint64_t>(std::numeric_limits<uint32_t>::max()))));
+    }
+    return data;
+}
+
+inline pb::test::ScalarSInt32 genScalarSInt32(std::size_t count) {
+    pb::test::ScalarSInt32 data;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint64_t n = genIntRandomUniformBytes(5);
+        data.add_numbers(static_cast<int32_t>(std::min(n, static_cast<std::uint64_t>(std::numeric_limits<int32_t>::max()))));
+    }
+    return data;
+}
+
+inline pb::test::ScalarInt64 genScalarInt64(std::size_t count) {
+    pb::test::ScalarInt64 data;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint64_t n = genIntRandomUniformBytes(10);
+        data.add_numbers(static_cast<int64_t>(std::min(n, static_cast<std::uint64_t>(std::numeric_limits<int64_t>::max()))));
+    }
+    return data;
+}
+
+inline pb::test::ScalarUInt64 genScalarUInt64(std::size_t count) {
+    pb::test::ScalarUInt64 data;
+    for (std::size_t i = 0; i < count; ++i) {
+        data.add_numbers(genIntRandomUniformBytes(10));
+    }
+    return data;
+}
+
+inline pb::test::ScalarSInt64 genScalarSInt64(std::size_t count) {
+    pb::test::ScalarSInt64 data;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint64_t n = genIntRandomUniformBytes(10);
+        data.add_numbers(static_cast<int64_t>(std::min(n, static_cast<std::uint64_t>(std::numeric_limits<int64_t>::max()))));
+    }
+    return data;
+}
+
+inline pb::test::ScalarBool genScalarBool(std::size_t count) {
+    pb::test::ScalarBool data;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dist(0, 1);
+    for (std::size_t i = 0; i < count; ++i) {
+        data.add_values(dist(gen) == 1);
+    }
+    return data;
+}
+
+inline pb::test::ScalarEnum genScalarEnum(std::size_t count) {
+    pb::test::ScalarEnum data;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<int> dist(0, 4);
+    for (std::size_t i = 0; i < count; ++i) {
+        data.add_values(static_cast<pb::test::TestEnum>(dist(gen)));
+    }
+    return data;
+}
+
+inline pb::test::ScalarDouble genScalarDouble(std::size_t count) {
+    pb::test::ScalarDouble data;
+    std::random_device rd;
+    std::mt19937 gen(rd());
     std::uniform_real_distribution<double> dist(
         std::numeric_limits<double>::lowest(),
         std::numeric_limits<double>::max()
     );
-
-    pb::test::ArrDouble data;
-    for (std::size_t i = 0; i < arrSize; ++i) {
-        data.add_numbers(dist(engine));
+    for (std::size_t i = 0; i < count; ++i) {
+        data.add_numbers(dist(gen));
     }
     return data;
 }
 
-inline pb::test::ArrFloat genFullRangeFloatData(std::size_t arrSize) {
-    static std::random_device rd;
-    static std::mt19937 engine(rd());
+inline pb::test::ScalarFloat genScalarFloat(std::size_t count) {
+    pb::test::ScalarFloat data;
+    std::random_device rd;
+    std::mt19937 gen(rd());
     std::uniform_real_distribution<float> dist(
         std::numeric_limits<float>::lowest(),
         std::numeric_limits<float>::max()
     );
-
-    pb::test::ArrFloat data;
-    for (std::size_t i = 0; i < arrSize; ++i) {
-        data.add_numbers(dist(engine));
+    for (std::size_t i = 0; i < count; ++i) {
+        data.add_numbers(dist(gen));
     }
     return data;
 }
 
-inline pb::test::ArrFixed32 genFixed32Data(std::size_t arrSize) {
-    static std::random_device rd;
-    static std::mt19937 engine(rd());
-    std::uniform_int_distribution<std::uint32_t> dist(
-        std::numeric_limits<std::uint32_t>::min(),
-        std::numeric_limits<std::uint32_t>::max()
+// Repeated type generators (packed=true)
+inline pb::test::RepeatedInt32 genRepeatedInt32(std::size_t count) {
+    pb::test::RepeatedInt32 data;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint64_t n = genIntRandomUniformBytes(5);
+        data.add_numbers(static_cast<int32_t>(std::min(n, static_cast<std::uint64_t>(std::numeric_limits<int32_t>::max()))));
+    }
+    return data;
+}
+
+inline pb::test::RepeatedUInt32 genRepeatedUInt32(std::size_t count) {
+    pb::test::RepeatedUInt32 data;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint64_t n = genIntRandomUniformBytes(5);
+        data.add_numbers(static_cast<uint32_t>(std::min(n, static_cast<std::uint64_t>(std::numeric_limits<uint32_t>::max()))));
+    }
+    return data;
+}
+
+inline pb::test::RepeatedSInt32 genRepeatedSInt32(std::size_t count) {
+    pb::test::RepeatedSInt32 data;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint64_t n = genIntRandomUniformBytes(5);
+        data.add_numbers(static_cast<int32_t>(std::min(n, static_cast<std::uint64_t>(std::numeric_limits<int32_t>::max()))));
+    }
+    return data;
+}
+
+inline pb::test::RepeatedInt64 genRepeatedInt64(std::size_t count) {
+    pb::test::RepeatedInt64 data;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint64_t n = genIntRandomUniformBytes(10);
+        data.add_numbers(static_cast<int64_t>(std::min(n, static_cast<std::uint64_t>(std::numeric_limits<int64_t>::max()))));
+    }
+    return data;
+}
+
+inline pb::test::RepeatedUInt64 genRepeatedUInt64(std::size_t count) {
+    pb::test::RepeatedUInt64 data;
+    for (std::size_t i = 0; i < count; ++i) {
+        data.add_numbers(genIntRandomUniformBytes(10));
+    }
+    return data;
+}
+
+inline pb::test::RepeatedSInt64 genRepeatedSInt64(std::size_t count) {
+    pb::test::RepeatedSInt64 data;
+    for (std::size_t i = 0; i < count; ++i) {
+        std::uint64_t n = genIntRandomUniformBytes(10);
+        data.add_numbers(static_cast<int64_t>(std::min(n, static_cast<std::uint64_t>(std::numeric_limits<int64_t>::max()))));
+    }
+    return data;
+}
+
+inline pb::test::RepeatedDouble genRepeatedDouble(std::size_t count) {
+    pb::test::RepeatedDouble data;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<double> dist(
+        std::numeric_limits<double>::lowest(),
+        std::numeric_limits<double>::max()
     );
-
-    pb::test::ArrFixed32 data;
-    for (std::size_t i = 0; i < arrSize; ++i) {
-        data.add_numbers(dist(engine));
+    for (std::size_t i = 0; i < count; ++i) {
+        data.add_numbers(dist(gen));
     }
     return data;
 }
 
-inline pb::test::ArrFixed64 genFixed64Data(std::size_t arrSize) {
-    static std::random_device rd;
-    static std::mt19937 engine(rd());
-    std::uniform_int_distribution<std::uint64_t> dist(
-        std::numeric_limits<std::uint64_t>::min(),
-        std::numeric_limits<std::uint64_t>::max()
+inline pb::test::RepeatedFloat genRepeatedFloat(std::size_t count) {
+    pb::test::RepeatedFloat data;
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_real_distribution<float> dist(
+        std::numeric_limits<float>::lowest(),
+        std::numeric_limits<float>::max()
     );
-
-    pb::test::ArrFixed64 data;
-    for (std::size_t i = 0; i < arrSize; ++i) {
-        data.add_numbers(dist(engine));
+    for (std::size_t i = 0; i < count; ++i) {
+        data.add_numbers(dist(gen));
     }
     return data;
-}
-
-inline pb::test::ArrSFixed32 genSFixed32Data(std::size_t arrSize) {
-    static std::random_device rd;
-    static std::mt19937 engine(rd());
-    std::uniform_int_distribution<std::int32_t> dist(
-        std::numeric_limits<std::int32_t>::min(),
-        std::numeric_limits<std::int32_t>::max()
-    );
-
-    pb::test::ArrSFixed32 data;
-    for (std::size_t i = 0; i < arrSize; ++i) {
-        data.add_numbers(dist(engine));
-    }
-    return data;
-}
-
-inline pb::test::ArrSFixed64 genSFixed64Data(std::size_t arrSize) {
-    static std::random_device rd;
-    static std::mt19937 engine(rd());
-    std::uniform_int_distribution<std::int64_t> dist(
-        std::numeric_limits<std::int64_t>::min(),
-        std::numeric_limits<std::int64_t>::max()
-    );
-
-    pb::test::ArrSFixed64 data;
-    for (std::size_t i = 0; i < arrSize; ++i) {
-        data.add_numbers(dist(engine));
-    }
-    return data;
-}
-
-inline pb::test::ArrData32 genData32(std::size_t arrSize, std::uint8_t byteNum) {
-    pb::test::ArrData32 data;
-    for (std::size_t i = 0; i < arrSize; ++i) {
-        std::uint64_t n = genIntRandomUniformBytes(byteNum);
-        data.add_numbers(static_cast<std::uint32_t>(std::min(n, static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max()))));
-    }
-    return data;
-}
-
-inline pb::test::ArrData64 genData64(std::size_t arrSize, std::uint8_t byteNum) {
-    pb::test::ArrData64 data;
-    for (std::size_t i = 0; i < arrSize; ++i) {
-        std::uint64_t n = genIntRandomUniformBytes(byteNum);
-        data.add_numbers(n);
-    }
-    return data;
-}
-
-/* --- Varint Macros --- */
-#define DEFINE_INT_SERIALIZE_BENCHMARK(type, size, len)                       \
-    static void BM_Serialize_INT##type##_##size##_##len(benchmark::State &state) \
-    {                                                                         \
-        pb::test::ArrData##type input = genData##type(size, len);             \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(uint##type##_t); \
-        for (auto _ : state) {                                                \
-            std::string serialized;                                           \
-            input.SerializeToString(&serialized);                             \
-            benchmark::DoNotOptimize(serialized);                             \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Serialize_INT##type##_##size##_##len);
-
-#define DEFINE_INT_DESERIALIZE_BENCHMARK(type, size, len)                     \
-    static void BM_Deserialize_INT##type##_##size##_##len(benchmark::State &state) \
-    {                                                                         \
-        pb::test::ArrData##type input = genData##type(size, len);             \
-        std::string serialized;                                               \
-        input.SerializeToString(&serialized);                                 \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(uint##type##_t); \
-        for (auto _ : state) {                                                \
-            pb::test::ArrData##type output;                                   \
-            output.ParseFromString(serialized);                               \
-            benchmark::DoNotOptimize(output);                                 \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Deserialize_INT##type##_##size##_##len);
-
-/* --- Double Macros (Randomized) --- */
-#define DEFINE_DOUBLE_SERIALIZE_BENCHMARK(size)                               \
-    static void BM_Serialize_Double_##size(benchmark::State &state)           \
-    {                                                                         \
-        pb::test::ArrDouble input = genFullRangeDoubleData(size);             \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(double); \
-        for (auto _ : state) {                                                \
-            std::string serialized;                                           \
-            input.SerializeToString(&serialized);                             \
-            benchmark::DoNotOptimize(serialized);                             \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Serialize_Double_##size);
-
-#define DEFINE_DOUBLE_DESERIALIZE_BENCHMARK(size)                             \
-    static void BM_Deserialize_Double_##size(benchmark::State &state)         \
-    {                                                                         \
-        pb::test::ArrDouble input = genFullRangeDoubleData(size);             \
-        std::string serialized;                                               \
-        input.SerializeToString(&serialized);                                 \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(double); \
-        for (auto _ : state) {                                                \
-            pb::test::ArrDouble output;                                       \
-            output.ParseFromString(serialized);                                \
-            benchmark::DoNotOptimize(output);                                 \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Deserialize_Double_##size);
-
-/* --- Float Macros (Randomized) --- */
-#define DEFINE_FLOAT_SERIALIZE_BENCHMARK(size)                                \
-    static void BM_Serialize_Float_##size(benchmark::State &state)            \
-    {                                                                         \
-        pb::test::ArrFloat input = genFullRangeFloatData(size);               \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(float); \
-        for (auto _ : state) {                                                \
-            std::string serialized;                                           \
-            input.SerializeToString(&serialized);                             \
-            benchmark::DoNotOptimize(serialized);                             \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Serialize_Float_##size);
-
-#define DEFINE_FLOAT_DESERIALIZE_BENCHMARK(size)                              \
-    static void BM_Deserialize_Float_##size(benchmark::State &state)          \
-    {                                                                         \
-        pb::test::ArrFloat input = genFullRangeFloatData(size);               \
-        std::string serialized;                                               \
-        input.SerializeToString(&serialized);                                 \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(float); \
-        for (auto _ : state) {                                                \
-            pb::test::ArrFloat output;                                        \
-            output.ParseFromString(serialized);                                \
-            benchmark::DoNotOptimize(output);                                 \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Deserialize_Float_##size);
-
-/* --- Fixed32 Macros --- */
-#define DEFINE_FIXED32_SERIALIZE_BENCHMARK(size)                              \
-    static void BM_Serialize_Fixed32_##size(benchmark::State &state)          \
-    {                                                                         \
-        pb::test::ArrFixed32 input = genFixed32Data(size);                    \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(uint32_t); \
-        for (auto _ : state) {                                                \
-            std::string serialized;                                           \
-            input.SerializeToString(&serialized);                             \
-            benchmark::DoNotOptimize(serialized);                             \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Serialize_Fixed32_##size);
-
-#define DEFINE_FIXED32_DESERIALIZE_BENCHMARK(size)                            \
-    static void BM_Deserialize_Fixed32_##size(benchmark::State &state)        \
-    {                                                                         \
-        pb::test::ArrFixed32 input = genFixed32Data(size);                    \
-        std::string serialized;                                               \
-        input.SerializeToString(&serialized);                                 \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(uint32_t); \
-        for (auto _ : state) {                                                \
-            pb::test::ArrFixed32 output;                                      \
-            output.ParseFromString(serialized);                                \
-            benchmark::DoNotOptimize(output);                                 \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Deserialize_Fixed32_##size);
-
-/* --- Fixed64 Macros --- */
-#define DEFINE_FIXED64_SERIALIZE_BENCHMARK(size)                              \
-    static void BM_Serialize_Fixed64_##size(benchmark::State &state)          \
-    {                                                                         \
-        pb::test::ArrFixed64 input = genFixed64Data(size);                    \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(uint64_t); \
-        for (auto _ : state) {                                                \
-            std::string serialized;                                           \
-            input.SerializeToString(&serialized);                             \
-            benchmark::DoNotOptimize(serialized);                             \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Serialize_Fixed64_##size);
-
-#define DEFINE_FIXED64_DESERIALIZE_BENCHMARK(size)                            \
-    static void BM_Deserialize_Fixed64_##size(benchmark::State &state)        \
-    {                                                                         \
-        pb::test::ArrFixed64 input = genFixed64Data(size);                    \
-        std::string serialized;                                               \
-        input.SerializeToString(&serialized);                                 \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(uint64_t); \
-        for (auto _ : state) {                                                \
-            pb::test::ArrFixed64 output;                                      \
-            output.ParseFromString(serialized);                                \
-            benchmark::DoNotOptimize(output);                                 \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Deserialize_Fixed64_##size);
-
-/* --- SFixed32 Macros --- */
-#define DEFINE_SFIXED32_SERIALIZE_BENCHMARK(size)                             \
-    static void BM_Serialize_SFixed32_##size(benchmark::State &state)         \
-    {                                                                         \
-        pb::test::ArrSFixed32 input = genSFixed32Data(size);                  \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(int32_t); \
-        for (auto _ : state) {                                                \
-            std::string serialized;                                           \
-            input.SerializeToString(&serialized);                             \
-            benchmark::DoNotOptimize(serialized);                             \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Serialize_SFixed32_##size);
-
-#define DEFINE_SFIXED32_DESERIALIZE_BENCHMARK(size)                           \
-    static void BM_Deserialize_SFixed32_##size(benchmark::State &state)       \
-    {                                                                         \
-        pb::test::ArrSFixed32 input = genSFixed32Data(size);                  \
-        std::string serialized;                                               \
-        input.SerializeToString(&serialized);                                 \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(int32_t); \
-        for (auto _ : state) {                                                \
-            pb::test::ArrSFixed32 output;                                     \
-            output.ParseFromString(serialized);                                \
-            benchmark::DoNotOptimize(output);                                 \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Deserialize_SFixed32_##size);
-
-/* --- SFixed64 Macros --- */
-#define DEFINE_SFIXED64_SERIALIZE_BENCHMARK(size)                             \
-    static void BM_Serialize_SFixed64_##size(benchmark::State &state)         \
-    {                                                                         \
-        pb::test::ArrSFixed64 input = genSFixed64Data(size);                  \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(int64_t); \
-        for (auto _ : state) {                                                \
-            std::string serialized;                                           \
-            input.SerializeToString(&serialized);                             \
-            benchmark::DoNotOptimize(serialized);                             \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Serialize_SFixed64_##size);
-
-#define DEFINE_SFIXED64_DESERIALIZE_BENCHMARK(size)                           \
-    static void BM_Deserialize_SFixed64_##size(benchmark::State &state)       \
-    {                                                                         \
-        pb::test::ArrSFixed64 input = genSFixed64Data(size);                  \
-        std::string serialized;                                               \
-        input.SerializeToString(&serialized);                                 \
-        const int64_t total_bytes = static_cast<int64_t>(size) * sizeof(int64_t); \
-        for (auto _ : state) {                                                \
-            pb::test::ArrSFixed64 output;                                     \
-            output.ParseFromString(serialized);                                \
-            benchmark::DoNotOptimize(output);                                 \
-        }                                                                     \
-        state.SetBytesProcessed(state.iterations() * total_bytes);            \
-    }                                                                         \
-    BENCHMARK(BM_Deserialize_SFixed64_##size);
-
-inline pb::test::Person makeStrData(std::string data) {
-    pb::test::Person person;
-    person.set_email(data);
-    return person;
-}
-
-inline std::string loadTestBuf(int len, std::string cycle) {
-    const int c_len = static_cast<int>(cycle.length());
-    std::string data;
-    while (len >= c_len) {
-        data.append(cycle);
-        len -= c_len;
-    }
-    for (int i = 0; i < len; i++) {
-        data.append("\x7F");
-    }
-    return data;
-}
-
-enum class Scene { kPureAscii = 0, kPureUtf8 = 1, kMixed = 2 };
-
-inline std::string GenerateFlexibleData(std::size_t target_size, Scene scene) {
-    std::string result;
-    result.reserve(target_size);
-
-    std::mt19937 gen(42);
-
-    float ascii_ratio = (scene == Scene::kPureAscii) ? 1.0f :
-                        (scene == Scene::kPureUtf8)  ? 0.0f : 0.5f;
-
-    std::vector<std::string> utf8_samples = {
-        "\xC2\xA2",
-        "\xE2\x82\xAC",
-        "\xF0\x90\xBF\x80"
-    };
-
-    std::uniform_real_distribution<float> dist(0.0, 1.0);
-
-    while (result.size() < target_size) {
-        if (dist(gen) < ascii_ratio) {
-            result.push_back(static_cast<char>(gen() % 128));
-        } else {
-            const std::string &sample = utf8_samples[gen() % utf8_samples.size()];
-            if (result.size() + sample.size() <= target_size) {
-                result.append(sample);
-            } else {
-                result.push_back(' ');
-            }
-        }
-    }
-    return result;
 }

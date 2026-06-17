@@ -1,0 +1,4 @@
+**/build*/
+*.pb.h
+*.pb.cc
+**/bin/

@@ -1,6 +1,0 @@
-syntax = "proto3";
-package pb.test;
-
-message ArrSFixed64 {
-    repeated sfixed64 numbers = 1 [packed=true];
-}
