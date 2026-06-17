@@ -19,7 +19,6 @@
 #include <unistd.h>
 
 #include <errno.h>
-
 #include <algorithm>
 #include <cctype>
 #include <fstream>
@@ -37,13 +36,15 @@
 #include "butil/atomicops.h"
 #include "butil/fast_rand.h"
 #include "butil/logging.h"
+#include "brpc/compress.h"
 #include "brpc/channel.h"
+#include "brpc/global.h"
 #include "brpc/rdma/rdma_helper.h"
 #include "brpc/server.h"
 #include "bthread/bthread.h"
 #include "bvar/latency_recorder.h"
 #include "bvar/variable.h"
-#include "test.pb.h"
+#include "press.pb.h"
 
 #ifdef BRPC_WITH_RDMA
 
@@ -52,7 +53,6 @@ DEFINE_int32(queue_depth, 1, "How many requests are pending per worker in closed
 DEFINE_int32(expected_qps, 0, "The expected QPS");
 DEFINE_int32(max_thread_num, 16, "The max number of threads are used");
 DEFINE_int32(attachment_size, -1, "Attachment size is used (in Bytes)");
-DEFINE_bool(echo_attachment, false, "Select whether attachment should be echo");
 DEFINE_string(connection_type, "single", "Connection type of the channel");
 DEFINE_string(protocol, "baidu_std", "Protocol type.");
 DEFINE_string(servers, "0.0.0.0:8002+0.0.0.0:8002", "IP Address of servers");
@@ -81,13 +81,13 @@ DEFINE_string(payload_format, "attachment",
 DEFINE_string(json_file, "", "Read raw JSON request body from this file");
 DEFINE_bool(json_echo_check, false,
             "Check raw JSON response body equals request body when echo_attachment is true");
-DEFINE_string(response_mode, "normal",
-              "Response handling mode for protobuf payload: normal or minimal");
 DEFINE_bool(record_latency, true,
             "Record latency percentiles. Disable for max-throughput tests to reduce client-side stats overhead");
+DEFINE_string(data_file, "./request_data.pb", "Path to the pre-generated pb data");
+DEFINE_string(request_compress_type, "none",
+              "Compression algorithm for request protobuf body: none/snappy/gzip/zlib/lz4");
 
 std::unique_ptr<bvar::LatencyRecorder> g_latency_recorder;
-bvar::LatencyRecorder g_server_cpu_recorder("server_cpu");
 bvar::LatencyRecorder g_client_cpu_recorder("client_cpu");
 butil::atomic<uint64_t> g_last_time(0);
 butil::atomic<uint64_t> g_total_bytes;
@@ -102,6 +102,10 @@ butil::atomic<int64_t> g_token(10000);
 butil::atomic<int64_t> g_open_loop_inflight_limit(0);
 std::vector<std::string> g_servers;
 std::string g_json_payload;
+brpc::CompressType g_request_compress_type = brpc::COMPRESS_TYPE_NONE;
+butil::atomic<size_t> g_request_idx(0);
+std::vector<test::Request> g_pregenerated_requests;
+std::vector<size_t> g_request_pb_sizes;
 volatile bool g_stop = false;
 std::mutex g_call_ids_mutex;
 std::unordered_set<uint64_t> g_call_ids;
@@ -112,8 +116,6 @@ const char* kClosedLoop = "closed_loop";
 const char* kOpenLoop = "open_loop";
 const char* kPayloadAttachment = "attachment";
 const char* kPayloadRawJson = "raw_json";
-const char* kResponseModeNormal = "normal";
-const char* kResponseModeMinimal = "minimal";
 const char* kRawJsonPath = "/test.PerfTestService/Test";
 
 struct ConnectionSlot {
@@ -145,20 +147,20 @@ struct Worker;
 
 struct RespClosure {
     brpc::Controller* cntl;
-    test::PerfTestResponse* resp;
+    test::Request* resp;
     Worker* worker;
     ConnectionSlot* slot;
     brpc::CallId call_id;
     bool track_call_id;
+    size_t request_idx;
 };
 
 struct Worker {
-    Worker(int worker_index_in, int attachment_size, bool echo_attachment)
+    Worker(int worker_index_in, int attachment_size)
         : worker_index(worker_index_in)
         , addr(NULL)
         , start_time_us(0)
         , stop(false)
-        , echo_attachment_flag(echo_attachment)
     {
         if (attachment_size > 0) {
             addr = malloc(attachment_size);
@@ -179,7 +181,6 @@ struct Worker {
     uint64_t start_time_us;
     volatile bool stop;
     butil::IOBuf attachment;
-    bool echo_attachment_flag;
 };
 
 std::vector<ConnectionSlot*> g_connection_slots;
@@ -198,14 +199,6 @@ static bool IsRawJsonPayload() {
 
 static bool IsAttachmentPayload() {
     return FLAGS_payload_format == kPayloadAttachment;
-}
-
-static bool IsMinimalResponseMode() {
-    return FLAGS_response_mode == kResponseModeMinimal;
-}
-
-static bool IsNormalResponseMode() {
-    return FLAGS_response_mode == kResponseModeNormal;
 }
 
 static int LatencyWindowSeconds() {
@@ -253,23 +246,89 @@ static bool InitRawJsonPayload(int attachment_size) {
     return true;
 }
 
-static std::string ExtractCpuUsageFromJson(const butil::IOBuf& body) {
-    const std::string text = body.to_string();
-    const std::string key = "\"cpu_usage\":\"";
-    size_t pos = text.find(key);
-    if (pos == std::string::npos) {
-        return "";
-    }
-    pos += key.size();
-    const size_t end = text.find('"', pos);
-    if (end == std::string::npos) {
-        return "";
-    }
-    return text.substr(pos, end - pos);
-}
-
 static uint64_t NowUs() {
     return butil::gettimeofday_us();
+}
+
+static std::string ToLower(std::string value) {
+    for (size_t i = 0; i < value.size(); ++i) {
+        value[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(value[i])));
+    }
+    return value;
+}
+
+static std::string JoinSupportedCompressionNames() {
+    std::vector<brpc::CompressHandler> handlers;
+    brpc::ListCompressHandler(&handlers);
+    std::string names = "none";
+    for (size_t i = 0; i < handlers.size(); ++i) {
+        names.append("/");
+        names.append(handlers[i].name);
+    }
+    return names;
+}
+
+static bool ParseCompressionType(const std::string& name,
+                                 brpc::CompressType* type,
+                                 std::string* error) {
+    const std::string normalized = ToLower(name);
+    if (normalized == "none") {
+        *type = brpc::COMPRESS_TYPE_NONE;
+        return true;
+    }
+    if (normalized == "snappy") {
+        *type = brpc::COMPRESS_TYPE_SNAPPY;
+    } else if (normalized == "gzip") {
+        *type = brpc::COMPRESS_TYPE_GZIP;
+    } else if (normalized == "zlib") {
+        *type = brpc::COMPRESS_TYPE_ZLIB;
+    } else if (normalized == "lz4") {
+        *type = brpc::COMPRESS_TYPE_LZ4;
+    } else {
+        *error = "Unknown compression type `" + name + "`, supported values: "
+               + JoinSupportedCompressionNames();
+        return false;
+    }
+    if (brpc::FindCompressHandler(*type) == NULL) {
+        *error = "Compression type `" + normalized + "` is defined but not registered "
+               "in this brpc build, supported values: " + JoinSupportedCompressionNames();
+        return false;
+    }
+    return true;
+}
+
+static int LoadTestData() {
+    std::ifstream input(FLAGS_data_file, std::ios::binary);
+    if (!input) {
+        LOG(WARNING) << "No data file: " << FLAGS_data_file
+                     << ", using a default empty request";
+        g_pregenerated_requests.clear();
+        g_pregenerated_requests.push_back(test::Request());
+        g_request_pb_sizes.clear();
+        g_request_pb_sizes.push_back(test::Request().ByteSizeLong());
+        return 0;
+    }
+    test::Requests collection;
+    if (!collection.ParseFromIstream(&input)) {
+        LOG(ERROR) << "Failed to parse data file: " << FLAGS_data_file;
+        return -1;
+    }
+    g_pregenerated_requests.clear();
+    g_pregenerated_requests.reserve(collection.requests_size());
+    g_request_pb_sizes.clear();
+    g_request_pb_sizes.reserve(collection.requests_size());
+    for (int i = 0; i < collection.requests_size(); ++i) {
+        test::Request req = collection.requests(i);
+        g_request_pb_sizes.push_back(req.ByteSizeLong());
+        g_pregenerated_requests.push_back(req);
+    }
+    if (g_pregenerated_requests.empty()) {
+        LOG(WARNING) << "No requests in data file: " << FLAGS_data_file
+                     << ", using a default empty request";
+        g_pregenerated_requests.push_back(test::Request());
+        g_request_pb_sizes.push_back(test::Request().ByteSizeLong());
+    }
+    return 0;
 }
 
 static bool ShouldStopByTime(uint64_t start_time_us) {
@@ -425,7 +484,7 @@ static void ContinueClosedLoopIfNeeded(Worker* worker) {
 
 static void HandleResponse(RespClosure* closure) {
     std::unique_ptr<brpc::Controller> cntl_guard(closure->cntl);
-    std::unique_ptr<test::PerfTestResponse> response_guard(closure->resp);
+    std::unique_ptr<test::Request> response_guard(closure->resp);
     std::unique_ptr<RespClosure> closure_guard(closure);
     ConnectionSlot* slot = closure->slot;
     Worker* worker = closure->worker;
@@ -456,37 +515,12 @@ static void HandleResponse(RespClosure* closure) {
             *g_latency_recorder << closure->cntl->latency_us();
         }
     }
-    if (!IsRawJsonPayload() && closure->resp != NULL &&
-        !closure->resp->cpu_usage().empty()) {
-        g_server_cpu_recorder << atof(closure->resp->cpu_usage().c_str()) * 100;
-    } else if (IsRawJsonPayload()) {
-        const std::string* cpu_header =
-                closure->cntl->http_response().GetHeader("X-Server-Cpu-Usage");
-        if (cpu_header != NULL && !cpu_header->empty()) {
-            g_server_cpu_recorder << atof(cpu_header->c_str()) * 100;
-        } else if (!worker->echo_attachment_flag) {
-            const std::string cpu_usage = ExtractCpuUsageFromJson(
-                    closure->cntl->response_attachment());
-            if (!cpu_usage.empty()) {
-                g_server_cpu_recorder << atof(cpu_usage.c_str()) * 100;
-            }
-        }
-        if (FLAGS_json_echo_check && worker->echo_attachment_flag) {
-            const std::string response_body =
-                    closure->cntl->response_attachment().to_string();
-            if (response_body != g_json_payload) {
-                slot->failed.fetch_add(1, butil::memory_order_relaxed);
-                g_failed_cnt.fetch_add(1, butil::memory_order_relaxed);
-                if (!g_stop) {
-                    LOG(ERROR) << "Raw JSON echo check failed";
-                }
-                ContinueClosedLoopIfNeeded(worker);
-                return;
-            }
-        }
-    }
+    // Calculate payload bytes: protobuf message + attachment for protobuf mode,
+    // or just JSON body for raw JSON mode
     const size_t payload_bytes = IsRawJsonPayload() ?
-            g_json_payload.size() : closure->cntl->request_attachment().size();
+            g_json_payload.size() :
+            (g_request_pb_sizes[closure->request_idx % g_request_pb_sizes.size()] +
+             closure->cntl->request_attachment().size());
     g_total_bytes.fetch_add(payload_bytes, butil::memory_order_relaxed);
     g_total_cnt.fetch_add(1, butil::memory_order_relaxed);
     UpdateClientCpuSample();
@@ -505,31 +539,38 @@ static bool SendRequest(Worker* worker) {
     closure->worker = worker;
     closure->slot = slot;
     closure->cntl = new brpc::Controller();
-    closure->resp =
-            (IsRawJsonPayload() || IsMinimalResponseMode()) ?
-            NULL : new test::PerfTestResponse();
+    closure->resp = IsRawJsonPayload() ? NULL : new test::Request();
     closure->track_call_id = FLAGS_cancel_inflight_on_stop;
+    closure->request_idx = 0;
     if (closure->track_call_id) {
         closure->call_id = closure->cntl->call_id();
         RegisterCallId(closure->call_id);
     }
+
     if (IsRawJsonPayload()) {
-        closure->cntl->http_request().uri() = std::string(kRawJsonPath) +
-                "?echo_attachment=" + (worker->echo_attachment_flag ? "true" : "false");
+        closure->cntl->http_request().uri() = kRawJsonPath;
         closure->cntl->http_request().set_method(brpc::HTTP_METHOD_POST);
         closure->cntl->http_request().set_content_type("application/json");
         closure->cntl->request_attachment().append(g_json_payload);
+    } else {
+        closure->cntl->set_request_compress_type(g_request_compress_type);
     }
+
     google::protobuf::Closure* done = brpc::NewCallback(&HandleResponse, closure);
     slot->sent.fetch_add(1, butil::memory_order_relaxed);
     int64_t inflight = g_inflight.fetch_add(1, butil::memory_order_relaxed) + 1;
     UpdatePeakInflight(inflight);
+
     if (IsRawJsonPayload()) {
         slot->channel->CallMethod(NULL, closure->cntl, NULL, NULL, done);
     } else {
-        test::PerfTestRequest request;
-        request.set_echo_attachment(worker->echo_attachment_flag);
-        request.set_minimal_response(IsMinimalResponseMode());
+        // Use pregenerated request data if available, otherwise use empty request
+        size_t idx = g_request_idx.fetch_add(1, butil::memory_order_relaxed);
+        const test::Request& request = g_pregenerated_requests.empty() ?
+                test::Request() :
+                g_pregenerated_requests[idx % g_pregenerated_requests.size()];
+        closure->request_idx = idx;
+
         closure->cntl->request_attachment().append(worker->attachment);
         test::PerfTestService_Stub stub(slot->channel);
         stub.Test(closure->cntl, &request, closure->resp, done);
@@ -575,7 +616,7 @@ static void* RunOpenLoopWorker(void* arg) {
     return NULL;
 }
 
-static int InitConnectionSlots(int connection_num, bool echo_attachment) {
+static int InitConnectionSlots(int connection_num) {
     for (size_t i = 0; i < g_connection_slots.size(); ++i) {
         delete g_connection_slots[i];
     }
@@ -606,20 +647,23 @@ static int InitConnectionSlots(int connection_num, bool echo_attachment) {
 
         brpc::Controller cntl;
         if (IsRawJsonPayload()) {
-            cntl.http_request().uri() = std::string(kRawJsonPath) +
-                    "?echo_attachment=" + (echo_attachment ? "true" : "false");
+            cntl.http_request().uri() = kRawJsonPath;
             cntl.http_request().set_method(brpc::HTTP_METHOD_POST);
             cntl.http_request().set_content_type("application/json");
             cntl.request_attachment().append(g_json_payload);
             slot->channel->CallMethod(NULL, &cntl, NULL, NULL, NULL);
         } else {
-            test::PerfTestResponse response;
-            test::PerfTestRequest request;
-            request.set_echo_attachment(echo_attachment);
-            request.set_minimal_response(IsMinimalResponseMode());
+            cntl.set_request_compress_type(g_request_compress_type);
+            test::Request response;
+
+            // Use pregenerated request data if available, otherwise use empty request
+            const test::Request& request = g_pregenerated_requests.empty() ?
+                    test::Request() :
+                    g_pregenerated_requests[g_request_idx.fetch_add(1, butil::memory_order_relaxed) %
+                                            g_pregenerated_requests.size()];
+
             test::PerfTestService_Stub stub(slot->channel);
-            stub.Test(&cntl, &request,
-                      IsMinimalResponseMode() ? NULL : &response, NULL);
+            stub.Test(&cntl, &request, &response, NULL);
         }
         if (cntl.Failed()) {
             LOG(ERROR) << "Warmup RPC failed on connection " << i << ": "
@@ -670,9 +714,7 @@ static void Test(int thread_num, int attachment_size) {
               << ", Depth: " << FLAGS_queue_depth
               << ", Attachment: " << attachment_size << "B"
               << ", RDMA: " << (FLAGS_use_rdma ? "yes" : "no")
-              << ", Echo: " << (FLAGS_echo_attachment ? "yes" : "no")
               << ", PayloadFormat: " << FLAGS_payload_format
-              << ", ResponseMode: " << FLAGS_response_mode
               << ", RecordLatency: " << (FLAGS_record_latency ? "true" : "false")
               << ", LoadMode: " << FLAGS_load_mode
               << ", ConnectionType: " << FLAGS_connection_type
@@ -701,11 +743,6 @@ static void Test(int thread_num, int attachment_size) {
     }
     const size_t request_bytes = IsRawJsonPayload() ?
             g_json_payload.size() : std::max(attachment_size, 0);
-    if (request_bytes >= 1024000 && FLAGS_echo_attachment && FLAGS_rpc_timeout_ms <= 2000) {
-        LOG(WARNING) << "Large echo payload with rpc_timeout_ms=" << FLAGS_rpc_timeout_ms
-                     << " may hit normal RPC timeout under pooled/open_loop pressure. "
-                     << "Consider --rpc_timeout_ms=10000 or higher for large-payload tests.";
-    }
 
     g_stop = false;
     g_last_time.store(0, butil::memory_order_relaxed);
@@ -717,6 +754,7 @@ static void Test(int thread_num, int attachment_size) {
     g_peak_inflight.store(0, butil::memory_order_relaxed);
     g_request_budget.store(FLAGS_test_iterations, butil::memory_order_relaxed);
     g_rr_index.store(0, butil::memory_order_relaxed);
+    g_request_idx.store(0, butil::memory_order_relaxed);
     g_open_loop_inflight_limit.store(
             open_loop_inflight_limit, butil::memory_order_relaxed);
     if (FLAGS_record_latency) {
@@ -726,7 +764,7 @@ static void Test(int thread_num, int attachment_size) {
         g_latency_recorder.reset();
     }
 
-    if (InitConnectionSlots(actual_connection_num, FLAGS_echo_attachment) < 0) {
+    if (InitConnectionSlots(actual_connection_num) < 0) {
         DestroyConnectionSlots();
         exit(1);
     }
@@ -735,7 +773,7 @@ static void Test(int thread_num, int attachment_size) {
     workers.reserve(thread_num);
     const int worker_attachment_size = IsRawJsonPayload() ? 0 : attachment_size;
     for (int k = 0; k < thread_num; ++k) {
-        workers.push_back(new Worker(k, worker_attachment_size, FLAGS_echo_attachment));
+        workers.push_back(new Worker(k, worker_attachment_size));
     }
 
     uint64_t start_time = NowUs();
@@ -813,13 +851,7 @@ static void Test(int thread_num, int attachment_size) {
                   << ", Failed: " << g_failed_cnt.load(butil::memory_order_relaxed)
                   << ", Timeout: " << g_timeout_cnt.load(butil::memory_order_relaxed)
                   << ", PeakInflight: " << g_peak_inflight.load(butil::memory_order_relaxed)
-                  << ", Server CPU-utilization: ";
-        if (!IsRawJsonPayload() && IsMinimalResponseMode()) {
-            std::cout << "N/A";
-        } else {
-            std::cout << g_server_cpu_recorder.latency(10) << "%";
-        }
-        std::cout << ", Client CPU-utilization: "
+                  << ", Client CPU-utilization: "
                   << g_client_cpu_recorder.latency(10) << "%"
                   << std::endl;
     } else {
@@ -848,6 +880,18 @@ static void Test(int thread_num, int attachment_size) {
 
 int main(int argc, char* argv[]) {
     GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
+    brpc::GlobalInitializeOrDie();
+
+    std::string error_text;
+    if (!ParseCompressionType(FLAGS_request_compress_type,
+                              &g_request_compress_type, &error_text)) {
+        LOG(ERROR) << error_text;
+        return -1;
+    }
+
+    if (LoadTestData() != 0) {
+        return -1;
+    }
 
     if (!IsClosedLoop() && !IsOpenLoop()) {
         LOG(ERROR) << "Invalid load_mode=" << FLAGS_load_mode
@@ -857,15 +901,6 @@ int main(int argc, char* argv[]) {
     if (!IsAttachmentPayload() && !IsRawJsonPayload()) {
         LOG(ERROR) << "Invalid payload_format=" << FLAGS_payload_format
                    << ", valid values are attachment and raw_json";
-        return -1;
-    }
-    if (!IsNormalResponseMode() && !IsMinimalResponseMode()) {
-        LOG(ERROR) << "Invalid response_mode=" << FLAGS_response_mode
-                   << ", valid values are normal and minimal";
-        return -1;
-    }
-    if (IsRawJsonPayload() && IsMinimalResponseMode()) {
-        LOG(ERROR) << "response_mode=minimal is only supported for protobuf attachment payloads";
         return -1;
     }
     if (IsRawJsonPayload() && !IsRawJsonProtocolAllowed()) {

@@ -15,15 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
-
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cerrno>
 #include <climits>
 #include <cstdlib>
+#include <fstream>
 #include <pthread.h>
 #include <sched.h>
 #include <string>
@@ -33,9 +35,11 @@
 #include "butil/atomicops.h"
 #include "butil/logging.h"
 #include "butil/time.h"
+#include "brpc/compress.h"
+#include "brpc/global.h"
 #include "brpc/server.h"
-#include "bvar/variable.h"
-#include "test.pb.h"
+#include "brpc/rpc_pb_message_factory.h"
+#include "press.pb.h"
 
 #ifdef BRPC_WITH_RDMA
 
@@ -45,6 +49,10 @@ DECLARE_int32(bthread_concurrency);
 
 DEFINE_int32(port, 8002, "TCP Port of this server");
 DEFINE_bool(use_rdma, true, "Use RDMA or not");
+DEFINE_bool(echo_attachment, false, "Select whether attachment should be echoed to response");
+DEFINE_string(response_compress_type, "none",
+              "Compression algorithm for response protobuf body: none/snappy/gzip/zlib/lz4");
+DEFINE_string(data_file, "./request_data.pb", "Path to the pre-generated pb data");
 DEFINE_int32(server_num_threads, -1,
              "Number of brpc server worker threads. -1 keeps brpc default, "
              "0 lets bthread_concurrency control the worker count, >0 sets "
@@ -59,6 +67,9 @@ DEFINE_string(server_worker_affinity_cpus, "",
 butil::atomic<uint64_t> g_last_time(0);
 std::vector<int> g_worker_affinity_cpus;
 std::atomic<int> g_next_worker_affinity_index(0);
+std::vector<test::Request> g_pregenerated_requests;
+butil::atomic<size_t> g_request_idx(0);
+brpc::CompressType g_response_compress_type = brpc::COMPRESS_TYPE_NONE;
 
 bool ParseNonNegativeInt(const std::string& token, int* value) {
     if (token.empty()) {
@@ -253,6 +264,79 @@ bool InitBthreadWorkerAffinity() {
     return true;
 }
 
+static std::string ToLower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
+
+static std::string JoinSupportedCompressionNames() {
+    std::vector<brpc::CompressHandler> handlers;
+    brpc::ListCompressHandler(&handlers);
+    std::string names = "none";
+    for (size_t i = 0; i < handlers.size(); ++i) {
+        names.append("/");
+        names.append(handlers[i].name);
+    }
+    return names;
+}
+
+static bool ParseCompressionType(const std::string& name,
+                                 brpc::CompressType* type,
+                                 std::string* error) {
+    const std::string normalized = ToLower(name);
+    if (normalized == "none") {
+        *type = brpc::COMPRESS_TYPE_NONE;
+        return true;
+    }
+    if (normalized == "snappy") {
+        *type = brpc::COMPRESS_TYPE_SNAPPY;
+    } else if (normalized == "gzip") {
+        *type = brpc::COMPRESS_TYPE_GZIP;
+    } else if (normalized == "zlib") {
+        *type = brpc::COMPRESS_TYPE_ZLIB;
+    } else if (normalized == "lz4") {
+        *type = brpc::COMPRESS_TYPE_LZ4;
+    } else {
+        *error = "Unknown compression type `" + name + "`, supported values: "
+               + JoinSupportedCompressionNames();
+        return false;
+    }
+    if (brpc::FindCompressHandler(*type) == NULL) {
+        *error = "Compression type `" + normalized + "` is defined but not registered "
+               "in this brpc build, supported values: " + JoinSupportedCompressionNames();
+        return false;
+    }
+    return true;
+}
+
+static int LoadTestData() {
+    std::ifstream input(FLAGS_data_file, std::ios::binary);
+    if (!input) {
+        LOG(WARNING) << "No data file: " << FLAGS_data_file
+                     << ", using a default empty request";
+        g_pregenerated_requests.clear();
+        g_pregenerated_requests.push_back(test::Request());
+        return 0;
+    }
+    test::Requests collection;
+    if (!collection.ParseFromIstream(&input)) {
+        LOG(ERROR) << "Failed to parse data file: " << FLAGS_data_file;
+        return -1;
+    }
+    g_pregenerated_requests.clear();
+    g_pregenerated_requests.reserve(collection.requests_size());
+    for (int i = 0; i < collection.requests_size(); ++i) {
+        g_pregenerated_requests.push_back(collection.requests(i));
+    }
+    if (g_pregenerated_requests.empty()) {
+        LOG(WARNING) << "No requests in data file: " << FLAGS_data_file
+                     << ", using a default empty request";
+        g_pregenerated_requests.push_back(test::Request());
+    }
+    return 0;
+}
+
 namespace test {
 class PerfTestServiceImpl : public PerfTestService {
 public:
@@ -260,52 +344,35 @@ public:
     ~PerfTestServiceImpl() {}
 
     void Test(google::protobuf::RpcController* cntl_base,
-              const PerfTestRequest* request,
-              PerfTestResponse* response,
+              const Request* request,
+              Request* response,
               google::protobuf::Closure* done) {
         brpc::ClosureGuard done_guard(done);
         brpc::Controller* cntl = static_cast<brpc::Controller*>(cntl_base);
-        if (cntl->request_protocol() != brpc::PROTOCOL_HTTP &&
-            cntl->request_protocol() != brpc::PROTOCOL_H2 &&
-            request->minimal_response()) {
-            response->set_cpu_usage("");
-            if (request->echo_attachment()) {
+
+        // Handle JSON/HTTP requests
+        if (cntl->request_protocol() == brpc::PROTOCOL_HTTP ||
+            cntl->request_protocol() == brpc::PROTOCOL_H2) {
+            // Check echo_attachment URL parameter
+            const std::string* echo_param =
+                    cntl->http_request().uri().GetQuery("echo_attachment");
+            const bool echo = echo_param != NULL &&
+                    (*echo_param == "true" || *echo_param == "1");
+
+            if (echo) {
+                // Echo back the original attachment
                 cntl->response_attachment().append(cntl->request_attachment());
             }
             return;
         }
 
-        uint64_t last = g_last_time.load(butil::memory_order_relaxed);
-        uint64_t now = butil::monotonic_time_us();
-        std::string cpu_usage;
-        if (now > last && now - last > 100000) {
-            if (g_last_time.exchange(now, butil::memory_order_relaxed) == last) {
-                cpu_usage = bvar::Variable::describe_exposed("process_cpu_usage");
-            } else {
-                cpu_usage.clear();
-            }
-        } else {
-            cpu_usage.clear();
-        }
-        if (cntl->request_protocol() == brpc::PROTOCOL_HTTP ||
-            cntl->request_protocol() == brpc::PROTOCOL_H2) {
-            cntl->http_response().set_content_type("application/json");
-            cntl->http_response().SetHeader("X-Server-Cpu-Usage", cpu_usage);
-            const std::string* echo_param =
-                    cntl->http_request().uri().GetQuery("echo_attachment");
-            const bool echo = echo_param != NULL &&
-                    (*echo_param == "true" || *echo_param == "1");
-            if (echo) {
-                cntl->response_attachment().append(cntl->request_attachment());
-            } else {
-                cntl->response_attachment().append("{\"cpu_usage\":\"");
-                cntl->response_attachment().append(cpu_usage);
-                cntl->response_attachment().append("\"}");
-            }
-            return;
-        }
-        response->set_cpu_usage(cpu_usage);
-        if (request->echo_attachment()) {
+        // Handle protobuf requests - use pregenerated data
+        const size_t index =
+                g_request_idx.fetch_add(1, butil::memory_order_relaxed) %
+                g_pregenerated_requests.size();
+        response->CopyFrom(g_pregenerated_requests[index]);
+        cntl->set_response_compress_type(g_response_compress_type);
+        if (FLAGS_echo_attachment) {
             cntl->response_attachment().append(cntl->request_attachment());
         }
     }
@@ -314,7 +381,23 @@ public:
 
 int main(int argc, char* argv[]) {
     GFLAGS_NAMESPACE::ParseCommandLineFlags(&argc, &argv, true);
+    brpc::GlobalInitializeOrDie();
+
+    // Initialize bthread worker affinity
     if (!InitBthreadWorkerAffinity()) {
+        return -1;
+    }
+
+    // Parse compression type
+    std::string error_text;
+    if (!ParseCompressionType(FLAGS_response_compress_type,
+                              &g_response_compress_type, &error_text)) {
+        LOG(ERROR) << error_text;
+        return -1;
+    }
+
+    // Load test data
+    if (LoadTestData() != 0) {
         return -1;
     }
 
@@ -328,13 +411,14 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << "Fail to add service";
         return -1;
     }
-    g_last_time.store(0, butil::memory_order_relaxed);
+    g_request_idx.store(0, butil::memory_order_relaxed);
 
     brpc::ServerOptions options;
     options.use_rdma = FLAGS_use_rdma;
     if (FLAGS_server_num_threads >= 0) {
         options.num_threads = FLAGS_server_num_threads;
     }
+    options.rpc_pb_message_factory = brpc::GetArenaRpcPBMessageFactory();
     LOG(INFO) << "Starting rdma_performance_server"
               << " port=" << FLAGS_port
               << " use_rdma=" << (FLAGS_use_rdma ? "true" : "false")
