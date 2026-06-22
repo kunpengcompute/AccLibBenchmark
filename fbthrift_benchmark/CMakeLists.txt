@@ -3,7 +3,7 @@ project(rpc_benchmark LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_BUILD_TYPE Debug)
+set(CMAKE_BUILD_TYPE Release)
 
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_SOURCE_DIR}/cmake")
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
@@ -11,9 +11,7 @@ list(PREPEND CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/third")
 
 find_package(FBThrift REQUIRED)
 find_package(fizz REQUIRED)
-find_package(fmt REQUIRED)
 find_package(folly REQUIRED)
-find_package(proxygen REQUIRED)
 find_package(wangle REQUIRED)
 
 file(GLOB GEN_CPP_SOURCES CONFIGURE_DEPENDS "gen-cpp2/*.cpp")
@@ -24,8 +22,6 @@ set(COMMON_LIBS
     Folly::folly
     wangle::wangle
     fizz::fizz
-    fmt::fmt
-    proxygen::proxygen
 )
 
 # 创建静态库，封装 Thrift 生成的代码
