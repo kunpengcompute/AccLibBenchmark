@@ -6,6 +6,7 @@
 #include <folly/portability/GFlags.h>
 #include <thrift/lib/cpp2/server/ThriftServer.h>
 #include <thrift/lib/cpp2/transport/rocket/server/RocketRoutingHandler.h>
+#include "server/LatencyObserver.h"
 
 #include "server/PerfTestService.h"
 #include "util/ResourceMonitor.h"
@@ -13,6 +14,7 @@
 DEFINE_int32(port, 8002, "TCP Port of this server");
 DEFINE_int32(num_io_threads, 1, "Number of IO worker threads");
 DEFINE_int32(num_cpu_threads, 1, "Number of CPU worker threads");
+DEFINE_string(latency_log, "", "Path to latency log file (if empty, latency tracking is disabled)");
 
 using apache::thrift::RocketRoutingHandler;
 using apache::thrift::ThriftServer;
@@ -120,6 +122,11 @@ int main(int argc, char** argv) {
   util::init_resource_collector();
 
   g_server = newServer<PerfTestServiceHandler>(FLAGS_port, FLAGS_num_io_threads, FLAGS_num_cpu_threads);
+
+  if (!FLAGS_latency_log.empty()) {
+      g_server->setObserver(std::make_shared<LatencyObserver>(FLAGS_latency_log));
+      fprintf(stderr, "Latency tracking enabled, output to: %s\n", FLAGS_latency_log.c_str());
+  }
 
   signal(SIGINT, signalHandler);
   signal(SIGTERM, signalHandler);
