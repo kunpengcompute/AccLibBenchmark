@@ -14,4 +14,5 @@ struct PerfTestResponse {
 service PerfTestService {
     PerfTestResponse test(1: Request req);
     binary simdjson_call(1: binary payload);
+    binary sonicjson_call(1: binary payload);
 }

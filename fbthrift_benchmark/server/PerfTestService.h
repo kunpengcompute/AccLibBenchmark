@@ -18,6 +18,7 @@ class PerfTestServiceHandler
 
   // simdjson codec method: binary in, binary out
   void simdjson_call(::std::string& out, std::unique_ptr<::std::string> data) override;
+  void sonicjson_call(::std::string& out, std::unique_ptr<::std::string> data) override;
 
  private:
   static std::atomic<uint64_t> g_last_resource_update_time;

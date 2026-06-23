@@ -6,6 +6,7 @@
 #include "util/ResourceMonitor.h"
 #include "SimdJsonCodec.h"
 #include "SonicJsonCodec.h"
+#include "SonicJsonCodec.h"
 
 namespace press_test {
 
@@ -40,5 +41,16 @@ void PerfTestServiceHandler::simdjson_call(::std::string& out, std::unique_ptr<:
     out = SimdJsonCodec::serialize(resp);
 }
 
+
+void PerfTestServiceHandler::sonicjson_call(::std::string& out, std::unique_ptr<::std::string> data) {
+    auto req = SonicJsonCodec::deserializeRequest(std::string_view(data->data(), data->size()));
+    PerfTestResponse resp;
+    if (req.echo_attachment().has_value() && *req.echo_attachment())
+        resp.payload() = req.payload().has_value() ? req.payload().value() : "";
+    auto snap = util::g_snapshot.load(std::memory_order_acquire);
+    resp.cpu_usage() = snap.cpu_percent;
+    resp.mem_usage() = snap.mem_percent;
+    out = SonicJsonCodec::serialize(resp);
+}
 
 } // namespace press_test
