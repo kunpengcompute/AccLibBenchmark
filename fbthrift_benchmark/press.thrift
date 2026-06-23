@@ -7,10 +7,11 @@ struct Request {
 
 struct PerfTestResponse {
     1: double cpu_usage;
-    2: double mem_usage;  
+    2: double mem_usage;
     3: binary payload;
 }
 
 service PerfTestService {
     PerfTestResponse test(1: Request req);
+    binary simdjson_call(1: binary payload);
 }
