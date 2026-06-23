@@ -51,3 +51,5 @@ add_executable(press_client
     client/PressTestClient.cpp util/ResourceMonitor.cpp
 )
 target_link_libraries(press_client PRIVATE thrift_generated ${COMMON_LIBS} atomic)
+add_executable(json_codec_ut json_codec_ut.cpp)
+target_link_libraries(json_codec_ut PRIVATE thrift_generated ${COMMON_LIBS})
