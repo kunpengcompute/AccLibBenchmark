@@ -38,15 +38,7 @@ third
 └── protobuf
 ```
 
-## 二、代码生成
-
-使用 thrift1 生成 C++（mstch_cpp2）代码：
-
-thrift1 --gen mstch_cpp2 press.thrift
-thrift1 --gen mstch_cpp2 universal.thrift
-protoc --cpp_out=./gen-cpp2 press.proto
-
-## 三、编译构建
+## 二、编译构建
 
 ```bash
   # 代码增加了  rocket header 序列化耗时延迟统计,和序列化反序列化耗时统计功能
@@ -58,7 +50,7 @@ protoc --cpp_out=./gen-cpp2 press.proto
   make -j
 ```
 
-## 四、服务端启动
+## 三、服务端启动
 
 ```bash
 
@@ -69,7 +61,7 @@ protoc --cpp_out=./gen-cpp2 press.proto
 ./press_server  --num_io_threads=5  --num_cpu_threads=5  --port=8002
 ```
 
-## 五、客户端压测
+## 四、客户端压测
 
 ```bash
 
@@ -102,7 +94,7 @@ protoc --cpp_out=./gen-cpp2 press.proto
 
 ```
 
-## 六、示例压测结果
+## 五、示例压测结果
 
 ### client
 

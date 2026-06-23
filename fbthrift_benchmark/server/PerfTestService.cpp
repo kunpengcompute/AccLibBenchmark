@@ -150,8 +150,12 @@ void UniversalServiceHandler::universal_test(
       size_t size_hint = pb_resp.ByteSizeLong();
       folly::IOBufQueue queue;
       press_test::IOBufAsZeroCopyOutputStream stream(&queue, size_hint);
-      pb_resp.SerializeToZeroCopyStream(&stream);
-      *response.payload() = queue.move();
+      if (pb_resp.SerializeToZeroCopyStream(&stream)) {
+        *response.payload() = queue.move();
+      } else {
+        LOG(ERROR) << "Failed to serialize protobuf response";
+        *response.payload() = nullptr;
+      }
       const auto ser_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - ser_start).count();
       g_univ_stats_slots[get_univ_slot_idx()]->serialize.addValue(ser_us);
       break;
