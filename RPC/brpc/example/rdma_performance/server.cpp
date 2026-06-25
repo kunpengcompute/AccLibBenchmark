@@ -28,14 +28,26 @@
 #include "brpc/server.h"
 #include "brpc/rpc_pb_message_factory.h"
 #include "bvar/variable.h"
+#include "bvar/latency_recorder.h"
+#include "butil/third_party/rapidjson/error/error.h"
+#include "json2pb/rapidjson.h"
 #include "press.pb.h"
+#ifdef BRPC_WITH_SONIC_JSON
+#include "sonic/sonic.h"
+#endif
 
 DEFINE_int32(port, 8002, "TCP Port of this server");
 DEFINE_bool(use_rdma, true, "Use RDMA or not");
 DEFINE_string(response_compress_type, "none",
               "Compression algorithm for response protobuf body: none/snappy/gzip/zlib");
 DEFINE_int32(num_threads, 8, "Number of threads for server");
+DEFINE_bool(enable_json_bench, false,
+            "Enable JSON parse/serialize benchmark on server side");
+DEFINE_string(json_engine, "sonic",
+              "JSON engine for benchmark: sonic or rapidjson");
 
+bvar::LatencyRecorder g_json_parse_latency("server_json_parse");
+bvar::LatencyRecorder g_json_serialize_latency("server_json_serialize");
 butil::atomic<uint64_t> g_last_time(0);
 brpc::CompressType g_response_compress_type = brpc::COMPRESS_TYPE_NONE;
 
@@ -54,6 +66,26 @@ std::string JoinSupportedCompressionNames() {
         names.append(handlers[i].name);
     }
     return names;
+}
+
+bool ValidateJsonBenchmarkOptions() {
+    if (!FLAGS_enable_json_bench) {
+        return true;
+    }
+    if (FLAGS_json_engine == "rapidjson") {
+        return true;
+    }
+    if (FLAGS_json_engine == "sonic") {
+#ifdef BRPC_WITH_SONIC_JSON
+        return true;
+#else
+        LOG(ERROR) << "json_engine=sonic requires WITH_SONIC_JSON=ON";
+        return false;
+#endif
+    }
+    LOG(ERROR) << "Unknown json_engine: " << FLAGS_json_engine
+               << ", expected rapidjson or sonic";
+    return false;
 }
 
 bool ParseCompressionType(const std::string& name,
@@ -120,12 +152,81 @@ public:
         response->set_server_response_compress_p99_ns(
             brpc::GetRpcCompressStageLatencyPercentile(
                 brpc::RPC_COMPRESS_STAGE_SERVER_RESPONSE, 0.99));
-        if (request->echo_attachment() && !request->payload().empty()) {
+
+        if (FLAGS_enable_json_bench && !request->payload().empty()) {
+            if (FLAGS_json_engine == "rapidjson") {
+                int64_t parse_start = butil::cpuwide_time_ns();
+                BUTIL_RAPIDJSON_NAMESPACE::Document doc;
+                doc.Parse(request->payload().c_str());
+                int64_t parse_end = butil::cpuwide_time_ns();
+                if (doc.HasParseError()) {
+                    cntl->SetFailed(brpc::EREQUEST,
+                                    "rapidjson parse failed: %s, offset=%zu, payload_size=%zu",
+                                    BUTIL_RAPIDJSON_NAMESPACE::GetParseError_En(
+                                        doc.GetParseError()),
+                                    doc.GetErrorOffset(),
+                                    request->payload().size());
+                    return;
+                }
+                BUTIL_RAPIDJSON_NAMESPACE::StringBuffer buffer;
+                BUTIL_RAPIDJSON_NAMESPACE::Writer<
+                    BUTIL_RAPIDJSON_NAMESPACE::StringBuffer> writer(buffer);
+                int64_t ser_start = butil::cpuwide_time_ns();
+                if (!doc.Accept(writer)) {
+                    cntl->SetFailed(brpc::ERESPONSE,
+                                    "rapidjson serialize failed, payload_size=%zu",
+                                    request->payload().size());
+                    return;
+                }
+                int64_t ser_end = butil::cpuwide_time_ns();
+                g_json_parse_latency << (parse_end - parse_start);
+                g_json_serialize_latency << (ser_end - ser_start);
+                response->set_payload(buffer.GetString(), buffer.GetSize());
+            }
+#ifdef BRPC_WITH_SONIC_JSON
+            else if (FLAGS_json_engine == "sonic") {
+                int64_t parse_start = butil::cpuwide_time_ns();
+                sonic_json::Document doc;
+                doc.Parse(request->payload().data(), request->payload().size());
+                int64_t parse_end = butil::cpuwide_time_ns();
+                if (doc.HasParseError()) {
+                    cntl->SetFailed(brpc::EREQUEST,
+                                    "sonic parse failed: %s, payload_size=%zu",
+                                    sonic_json::ErrorMsg(doc.GetParseError()),
+                                    request->payload().size());
+                    return;
+                }
+                sonic_json::WriteBuffer wb;
+                int64_t ser_start = butil::cpuwide_time_ns();
+                const sonic_json::SonicError err = doc.Serialize(wb);
+                if (err != sonic_json::kErrorNone) {
+                    cntl->SetFailed(brpc::ERESPONSE,
+                                    "sonic serialize failed: %s, payload_size=%zu",
+                                    sonic_json::ErrorMsg(err),
+                                    request->payload().size());
+                    return;
+                }
+                int64_t ser_end = butil::cpuwide_time_ns();
+                g_json_parse_latency << (parse_end - parse_start);
+                g_json_serialize_latency << (ser_end - ser_start);
+                response->set_payload(wb.ToString(), wb.Size());
+            }
+#endif
+        } else if (request->echo_attachment() && !request->payload().empty()) {
             response->set_payload(request->payload());
         }
         if (request->echo_attachment()) {
             cntl->response_attachment().append(cntl->request_attachment());
         }
+
+        response->set_json_parse_avg_ns(
+            static_cast<int64_t>(g_json_parse_latency.latency(10)));
+        response->set_json_parse_p99_ns(
+            static_cast<int64_t>(g_json_parse_latency.latency_percentile(0.99)));
+        response->set_json_serialize_avg_ns(
+            static_cast<int64_t>(g_json_serialize_latency.latency(10)));
+        response->set_json_serialize_p99_ns(
+            static_cast<int64_t>(g_json_serialize_latency.latency_percentile(0.99)));
     }
 };
 }
@@ -140,11 +241,14 @@ int main(int argc, char* argv[]) {
         LOG(ERROR) << error_text;
         return -1;
     }
+    if (!ValidateJsonBenchmarkOptions()) {
+        return -1;
+    }
 
     brpc::Server server;
     press_test::PerfTestServiceImpl perf_test_service_impl;
 
-    if (server.AddService(&perf_test_service_impl, 
+    if (server.AddService(&perf_test_service_impl,
                           brpc::SERVER_DOESNT_OWN_SERVICE) != 0) {
         LOG(ERROR) << "Fail to add service";
         return -1;

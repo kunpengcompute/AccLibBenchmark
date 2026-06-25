@@ -25,6 +25,8 @@
 #include <thrift/lib/cpp2/gen/client_cpp.h>
 #include "gen-cpp2/PerfTestService.h"
 #include "gen-cpp2/UniversalService.h"
+#include "SimdJsonCodec.h"
+#include "SonicJsonCodec.h"
 #include "gen-cpp2/press.pb.h"
 #include "util/LatencyStats.h"
 #include "util/ResourceMonitor.h"
@@ -40,7 +42,7 @@ DEFINE_bool(echo_attachment, false, "Echo payload back");
 DEFINE_int32(rpc_timeout_ms, 2000, "RPC timeout in ms");
 DEFINE_int32(test_seconds, 20, "Test duration");
 DEFINE_int32(test_iterations, 0, "Test iterations (0 = time-based)");
-DEFINE_string(mode, "native", "Client mode: native, universal");
+DEFINE_string(mode, "native", "Client mode: native, universal, simdjson");
 DEFINE_string(thrift_serialization, "thrift_binary", "Thrift serialization: thrift_binary, thrift_compact, thrift_json");
 DEFINE_string(universal_serialization, "none", "Universal serialization: protobuf, simdjson");
 DEFINE_string(compression, "none", "Compression algorithm: none, zlib, zstd, snappy, lz4");
@@ -216,16 +218,28 @@ static int get_stats_idx() {
   return g_stats_idx;
 }
 
+// ============ SimdJSON Codec Stats ============
+struct SimdJsonStats {
+  std::atomic<int64_t> encode_count{0};
+  std::atomic<int64_t> encode_ns{0};
+  std::atomic<int64_t> decode_count{0};
+  std::atomic<int64_t> decode_ns{0};
+};
+static SimdJsonStats g_simdjson_stats;
+static SimdJsonStats g_sonicjson_stats;
+
 // ============ Serialization Handler (for universal mode) ============
 struct SerializationHandler {
   virtual ~SerializationHandler() = default;
-  virtual std::unique_ptr<folly::IOBuf> serialize(const std::string& payload, bool echo_attachment) = 0;
-  virtual void processResponse(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) = 0;
+  virtual std::unique_ptr<folly::IOBuf> serializeIOBuf(const std::string& payload, bool echo_attachment) = 0;
+  virtual void processResponseIOBuf(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) = 0;
+  virtual std::string serializeString(const std::string& payload, bool echo_attachment) = 0;
+  virtual void processResponseString(const std::string& payload, ThreadStats& stats) = 0;
   virtual universal::SerializationType getType() const = 0;
 };
 
 struct ProtobufHandler : SerializationHandler {
-  std::unique_ptr<folly::IOBuf> serialize(const std::string& payload, bool echo_attachment) override {
+  std::unique_ptr<folly::IOBuf> serializeIOBuf(const std::string& payload, bool echo_attachment) override {
     press_test_proto::Request req;
     req.set_echo_attachment(echo_attachment);
     req.set_payload(payload);
@@ -236,7 +250,7 @@ struct ProtobufHandler : SerializationHandler {
     return queue.move();
   }
 
-  void processResponse(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) override {
+  void processResponseIOBuf(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) override {
     press_test_proto::PerfTestResponse resp;
     const auto deser_start = std::chrono::steady_clock::now();
     if (payload) {
@@ -264,18 +278,25 @@ struct ProtobufHandler : SerializationHandler {
   }
 };
 
-struct SimdJsonHandler : SerializationHandler {
-  std::unique_ptr<folly::IOBuf> serialize(const std::string& payload, bool echo_attachment) override {
-    LOG(FATAL) << "SimdJson serialization not implemented yet";
-    return nullptr;
+struct UniversalSimdJsonHandler : SerializationHandler {
+  std::string serializeString(const std::string& payload, bool echo_attachment) override {
+    press_test::Request req;
+    req.echo_attachment() = echo_attachment;
+    req.payload() = payload;
+    return press_test::SimdJsonCodec::serialize(req);
   }
 
-  void processResponse(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) override {
-    LOG(FATAL) << "SimdJson deserialization not implemented yet";
+  void processResponseString(const std::string& payload, ThreadStats& stats) override {
+    auto resp = press_test::SimdJsonCodec::deserializeResponse(payload);
+    if (resp.cpu_usage().has_value() && *resp.cpu_usage() > 0)
+      stats.server_cpu_usage.addValue(*resp.cpu_usage());
+    if (resp.mem_usage().has_value() && *resp.mem_usage() > 0)
+      stats.server_mem_usage.addValue(*resp.mem_usage());
+    g_total_bytes.fetch_add(resp.payload().has_value() ? resp.payload()->size() : 0,
+                            std::memory_order_relaxed);
   }
 
   universal::SerializationType getType() const override {
-    LOG(FATAL) << "SimdJson serialization type not defined";
     return universal::SerializationType::SIMD_JSON;
   }
 };
@@ -284,7 +305,7 @@ std::unique_ptr<SerializationHandler> createSerializationHandler(const std::stri
   if (type == "protobuf") {
     return std::make_unique<ProtobufHandler>();
   } else if (type == "simdjson") {
-    return std::make_unique<SimdJsonHandler>();
+    return std::make_unique<UniversalSimdJsonHandler>();
   }
   LOG(FATAL) << "Unknown universal serialization: " << type;
   return nullptr;
@@ -318,8 +339,11 @@ void createClientInEvb(ConnContext* ctx,
 struct BenchmarkState {
   std::vector<std::unique_ptr<ConnContext>> ctxs;
   press_test::Request request;
+  std::string simdjson_encoded;  // pre-encoded for simdjson mode
   std::unique_ptr<SerializationHandler> serialization_handler;
-  bool is_native_mode;
+  bool is_native_mode{true};
+  bool is_simdjson_mode{false};
+  bool is_sonicjson_mode{false};
   uint64_t start_time{0};
   std::atomic<int> total_inflight{0};
   std::atomic<uint64_t> total_processed{0};
@@ -336,17 +360,31 @@ std::shared_ptr<BenchmarkState> run_benchmark(
   int num_connections = FLAGS_connections;
   int num_evbs = static_cast<int>(evb_list.size());
   bool is_native_mode = (FLAGS_mode == "native");
+  bool is_simdjson_mode = (FLAGS_mode == "simdjson");
+  bool is_sonicjson_mode = (FLAGS_mode == "sonicjson");
   auto protocolId = getProtocolId(FLAGS_thrift_serialization);
 
-  if (!is_native_mode && FLAGS_universal_serialization == "none") {
+  if (!is_native_mode && !is_simdjson_mode && !is_sonicjson_mode && FLAGS_universal_serialization == "none") {
     LOG(FATAL) << "universal_serialization must be set when mode is universal";
   }
 
   auto state = std::make_shared<BenchmarkState>();
   state->is_native_mode = is_native_mode;
+  state->is_simdjson_mode = is_simdjson_mode;
+  state->is_sonicjson_mode = is_sonicjson_mode;
 
-  if (!is_native_mode) {
+  if (!is_native_mode && !is_simdjson_mode && !is_sonicjson_mode) {
     state->serialization_handler = createSerializationHandler(FLAGS_universal_serialization);
+  }
+
+  // Pre-encode for simdjson mode
+  if (is_simdjson_mode || is_sonicjson_mode) {
+    state->request.echo_attachment() = FLAGS_echo_attachment;
+    state->request.payload() = payload;
+    state->simdjson_encoded = press_test::SimdJsonCodec::serialize(state->request);
+    LOG(INFO) << (is_simdjson_mode ? "SimdJSON" : "SonicJSON")
+              << " mode: pre-encoded payload, json_size="
+              << state->simdjson_encoded.size();
   }
 
   for (int i = 0; i < num_connections; ++i) {
@@ -354,7 +392,7 @@ std::shared_ptr<BenchmarkState> run_benchmark(
     ctx->evb_idx = i % num_evbs;
     ctx->evb = evb_list[ctx->evb_idx];
 
-    if (is_native_mode) {
+    if (is_native_mode || is_simdjson_mode || is_sonicjson_mode) {
       createClientInEvb<PerfTestClient>(ctx.get(), addr, FLAGS_transport, protocolId);
     } else {
       createClientInEvb<UniversalClient>(ctx.get(), addr, FLAGS_transport, protocolId);
@@ -364,7 +402,7 @@ std::shared_ptr<BenchmarkState> run_benchmark(
   }
 
   state->request.echo_attachment() = FLAGS_echo_attachment;
-  state->request.payload() = folly::IOBuf::copyBuffer(payload);
+  state->request.payload() = folly::IOBuf::copyBuffer(payload);  TODO：这里不一样
   state->start_time = monotonic_us();
 
   // ========================================================================
@@ -440,7 +478,75 @@ std::shared_ptr<BenchmarkState> run_benchmark(
       }
     };
 
-    if (state->is_native_mode) {
+    if (state->is_simdjson_mode) {
+      // === SimdJSON mode: encode -> simdjson_call RPC -> decode ===
+      int64_t encode_start = monotonic_us();
+      std::string json = press_test::SimdJsonCodec::serialize(state->request);
+      int64_t encode_ns = (monotonic_us() - encode_start) * 1000;
+      g_simdjson_stats.encode_ns.fetch_add(encode_ns, std::memory_order_relaxed);
+      g_simdjson_stats.encode_count.fetch_add(1, std::memory_order_relaxed);
+
+
+      int64_t send_time = monotonic_us();
+      std::get<std::unique_ptr<PerfTestClient>>(ctx.client)->semifuture_simdjson_call(json)
+          .via(cpu_executor)
+          .thenTry([state, idx, send_time, on_response, json](folly::Try<::std::string>&& t) {
+            int64_t recv_time = monotonic_us();
+            if (t.hasValue()) {
+              int64_t decode_start = monotonic_us();
+              auto resp = press_test::SimdJsonCodec::deserializeResponse(t.value());
+              int64_t decode_ns = (monotonic_us() - decode_start) * 1000;
+              g_simdjson_stats.decode_ns.fetch_add(decode_ns, std::memory_order_relaxed);
+              g_simdjson_stats.decode_count.fetch_add(1, std::memory_order_relaxed);
+
+              on_response(send_time, recv_time, true);
+              if (resp.cpu_usage().has_value() && *resp.cpu_usage() > 0) {
+                g_stats_per_cpu[get_stats_idx()]->server_cpu_usage.addValue(*resp.cpu_usage());
+              }
+              if (resp.mem_usage().has_value() && *resp.mem_usage() > 0) {
+                g_stats_per_cpu[get_stats_idx()]->server_mem_usage.addValue(*resp.mem_usage());
+              }
+              g_total_bytes.fetch_add(
+                  json.size() + t.value().size(),
+                  std::memory_order_relaxed);
+            } else {
+              on_response(send_time, recv_time, false);
+              LOG(ERROR) << "SimdJSON RPC failed: " << t.exception().what();
+            }
+          });
+    } else if (state->is_sonicjson_mode) {
+      // === SonicJSON mode: encode -> simdjson_call RPC -> decode ===
+      int64_t encode_start = monotonic_us();
+      std::string json = press_test::SonicJsonCodec::serialize(state->request);
+      int64_t encode_ns = (monotonic_us() - encode_start) * 1000;
+      g_sonicjson_stats.encode_ns.fetch_add(encode_ns, std::memory_order_relaxed);
+      g_sonicjson_stats.encode_count.fetch_add(1, std::memory_order_relaxed);
+
+      int64_t send_time = monotonic_us();
+      std::get<std::unique_ptr<PerfTestClient>>(ctx.client)->semifuture_simdjson_call(json)
+          .via(cpu_executor)
+          .thenTry([state, idx, send_time, on_response, json](folly::Try<::std::string>&& t) {
+            int64_t recv_time = monotonic_us();
+            if (t.hasValue()) {
+              int64_t decode_start = monotonic_us();
+              auto resp = press_test::SonicJsonCodec::deserializeResponse(t.value());
+              int64_t decode_ns = (monotonic_us() - decode_start) * 1000;
+              g_sonicjson_stats.decode_ns.fetch_add(decode_ns, std::memory_order_relaxed);
+              g_sonicjson_stats.decode_count.fetch_add(1, std::memory_order_relaxed);
+
+              on_response(send_time, recv_time, true);
+              if (resp.cpu_usage().has_value() && *resp.cpu_usage() > 0)
+                g_stats_per_cpu[get_stats_idx()]->server_cpu_usage.addValue(*resp.cpu_usage());
+              if (resp.mem_usage().has_value() && *resp.mem_usage() > 0)
+                g_stats_per_cpu[get_stats_idx()]->server_mem_usage.addValue(*resp.mem_usage());
+              g_total_bytes.fetch_add(json.size() + t.value().size(), std::memory_order_relaxed);
+            } else {
+              on_response(send_time, recv_time, false);
+              LOG(ERROR) << "SonicJSON RPC failed: " << t.exception().what();
+            }
+          });
+    } else if (state->is_native_mode) {
+      // === Native mode: native_test() RPC ===
       int64_t send_time = monotonic_us();
       std::get<std::unique_ptr<PerfTestClient>>(ctx.client)->semifuture_native_test(state->request)
           .via(cpu_executor)
@@ -464,6 +570,7 @@ std::shared_ptr<BenchmarkState> run_benchmark(
             }
           });
     } else {
+      // === Universal mode: universal_test() RPC ===
       int64_t serialize_start = monotonic_us();
       std::string payload_input;
       auto& req_payload = *state->request.payload();
@@ -652,6 +759,7 @@ void test_once(int payload_size) {
       std::chrono::duration_cast<std::chrono::milliseconds>(test_end - test_start)
           .count();
   double elapsed_sec = elapsed_ms / 1000.0;
+  elapsed_sec = FLAGS_test_seconds;
 
   // Aggregate stats from all CPU threads (no locks needed during aggregation)
   util::HistogramStats<int64_t> total_latency(100, 0, 5000000);
@@ -789,6 +897,28 @@ void test_once(int payload_size) {
             << " p90=" << response_deserialize_p90
             << " p99=" << response_deserialize_p99
             << " p999=" << response_deserialize_p999;
+
+  if (FLAGS_mode == "sonicjson") {
+    int64_t enc_count = g_sonicjson_stats.encode_count.load();
+    int64_t dec_count = g_sonicjson_stats.decode_count.load();
+    if (enc_count > 0 && dec_count > 0) {
+      LOG(INFO) << "SonicJSON Encode (us): avg=" << std::fixed << std::setprecision(2)
+                << (g_sonicjson_stats.encode_ns.load() / enc_count / 1000.0);
+      LOG(INFO) << "SonicJSON Decode (us): avg=" << std::fixed << std::setprecision(2)
+                << (g_sonicjson_stats.decode_ns.load() / dec_count / 1000.0);
+    }
+  }
+
+  if (FLAGS_mode == "simdjson") {
+    int64_t enc_count = g_simdjson_stats.encode_count.load();
+    int64_t dec_count = g_simdjson_stats.decode_count.load();
+    if (enc_count > 0 && dec_count > 0) {
+      LOG(INFO) << "SimdJSON Encode (us): avg=" << std::fixed << std::setprecision(2)
+                << (g_simdjson_stats.encode_ns.load() / enc_count / 1000.0);
+      LOG(INFO) << "SimdJSON Decode (us): avg=" << std::fixed << std::setprecision(2)
+                << (g_simdjson_stats.decode_ns.load() / dec_count / 1000.0);
+    }
+  }
 
   if (FLAGS_mode == "universal" && total_univ_serialize.getCount() > 0) {
     LOG(INFO) << "Universal Request Serialization (us) :"

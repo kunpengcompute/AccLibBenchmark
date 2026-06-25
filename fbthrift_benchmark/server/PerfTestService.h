@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstdint>
+#include <string>
 #include "gen-cpp2/PerfTestService.h"
 #include "gen-cpp2/UniversalService.h"
 #include "util/LatencyStats.h"
@@ -15,9 +16,13 @@ class PerfTestServiceHandler
       PerfTestResponse& response,
       std::unique_ptr<Request> req) override;
 
+  // simdjson codec method: binary in, binary out
+  void simdjson_call(::std::string& out, std::unique_ptr<::std::string> data) override;
+  void sonicjson_call(::std::string& out, std::unique_ptr<::std::string> data) override;
+
  private:
   static std::atomic<uint64_t> g_last_resource_update_time;
-  static constexpr uint64_t CPU_UPDATE_INTERVAL_US = 100000;  // 100ms
+  static constexpr uint64_t CPU_UPDATE_INTERVAL_US = 100000;
 };
 
 } // namespace press_test
