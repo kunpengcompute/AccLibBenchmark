@@ -1,11 +1,11 @@
 #pragma once
 
 #define SONIC_ARCH_ARM 1
-#include "sonic/sonic.h"
-#include <thrift/lib/cpp/protocol/TBase64Utils.h>
 #include <string>
 #include <string_view>
 #include <stdexcept>
+#include "sonic/sonic.h"
+#include <thrift/lib/cpp/protocol/TBase64Utils.h>
 #include "gen-cpp2/press_types.h"
 
 namespace press_test {
@@ -28,10 +28,17 @@ static std::string sonicSerializeRequest(const Request& req) {
     {
         sonic_json::Node inner;
         inner.SetObject();
-        if (req.payload().has_value()) {
-            auto b64 = apache::thrift::protocol::base64Encode(folly::ByteRange(
-                reinterpret_cast<const uint8_t*>(req.payload()->data()),
-                req.payload()->size()));
+        if (req.payload().has_value() && *req.payload()) {
+            auto& buf = *req.payload();
+            std::string b64;
+            if (buf->isChained()) {
+                auto coalesced = buf->cloneCoalesced();
+                b64 = apache::thrift::protocol::base64Encode(
+                    folly::ByteRange(coalesced->data(), coalesced->length()));
+            } else {
+                b64 = apache::thrift::protocol::base64Encode(
+                    folly::ByteRange(buf->data(), buf->length()));
+            }
             while (!b64.empty() && b64.back() == '=') b64.pop_back();
             inner.AddMember("str", sonic_json::Node(b64, alloc), alloc);
         } else {
@@ -65,10 +72,17 @@ static std::string sonicSerializeResponse(const PerfTestResponse& resp) {
     {
         sonic_json::Node inner;
         inner.SetObject();
-        if (resp.payload().has_value()) {
-            auto b64 = apache::thrift::protocol::base64Encode(folly::ByteRange(
-                reinterpret_cast<const uint8_t*>(resp.payload()->data()),
-                resp.payload()->size()));
+        if (resp.payload().has_value() && *resp.payload()) {
+            auto& buf = *resp.payload();
+            std::string b64;
+            if (buf->isChained()) {
+                auto coalesced = buf->cloneCoalesced();
+                b64 = apache::thrift::protocol::base64Encode(
+                    folly::ByteRange(coalesced->data(), coalesced->length()));
+            } else {
+                b64 = apache::thrift::protocol::base64Encode(
+                    folly::ByteRange(buf->data(), buf->length()));
+            }
             inner.AddMember("str", sonic_json::Node(b64, alloc), alloc);
         } else {
             inner.AddMember("str", sonic_json::Node("", alloc), alloc);
@@ -98,9 +112,8 @@ static Request sonicDeserializeRequest(std::string_view json) {
         if (key == "1") {
             req.echo_attachment() = (jt->value.GetInt64() != 0);
         } else if (key == "2") {
-            auto b64 = std::string(jt->value.GetString());
-            auto decoded = apache::thrift::protocol::base64Decode(b64);
-            req.payload() = decoded->moveToFbString().toStdString();
+            req.payload() = apache::thrift::protocol::base64Decode(
+                folly::StringPiece(jt->value.GetString()));
         }
     }
     return req;
@@ -123,9 +136,8 @@ static PerfTestResponse sonicDeserializeResponse(std::string_view json) {
         else if (key == "1")
             resp.mem_usage() = jt->value.GetDouble();
         else if (key == "2") {
-            auto b64 = std::string(jt->value.GetString());
-            auto decoded = apache::thrift::protocol::base64Decode(b64);
-            resp.payload() = decoded->moveToFbString().toStdString();
+            resp.payload() = apache::thrift::protocol::base64Decode(
+                folly::StringPiece(jt->value.GetString()));
         }
     }
     return resp;

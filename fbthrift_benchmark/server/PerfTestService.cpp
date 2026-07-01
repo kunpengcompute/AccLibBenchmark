@@ -44,8 +44,8 @@ void PerfTestServiceHandler::native_test(PerfTestResponse &response,
 void PerfTestServiceHandler::simdjson_call(::std::string& out, std::unique_ptr<::std::string> data) {
     auto req = SimdJsonCodec::deserializeRequest(std::string_view(data->data(), data->size()));
     PerfTestResponse resp;
-    if (req.echo_attachment().has_value() && *req.echo_attachment())
-        resp.payload() = req.payload().has_value() ? req.payload().value() : "";
+    if (req.echo_attachment().has_value() && *req.echo_attachment() && req.payload().has_value())
+        resp.payload() = std::move(*req.payload());
     auto snap = util::g_snapshot.load(std::memory_order_acquire);
     resp.cpu_usage() = snap.cpu_percent;
     resp.mem_usage() = snap.mem_percent;
@@ -56,8 +56,8 @@ void PerfTestServiceHandler::simdjson_call(::std::string& out, std::unique_ptr<:
 void PerfTestServiceHandler::sonicjson_call(::std::string& out, std::unique_ptr<::std::string> data) {
     auto req = SonicJsonCodec::deserializeRequest(std::string_view(data->data(), data->size()));
     PerfTestResponse resp;
-    if (req.echo_attachment().has_value() && *req.echo_attachment())
-        resp.payload() = req.payload().has_value() ? req.payload().value() : "";
+    if (req.echo_attachment().has_value() && *req.echo_attachment() && req.payload().has_value())
+        resp.payload() = std::move(*req.payload());
     auto snap = util::g_snapshot.load(std::memory_order_acquire);
     resp.cpu_usage() = snap.cpu_percent;
     resp.mem_usage() = snap.mem_percent;
