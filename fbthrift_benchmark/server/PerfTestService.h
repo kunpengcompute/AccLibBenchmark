@@ -12,7 +12,7 @@ namespace press_test {
 class PerfTestServiceHandler
     : virtual public apache::thrift::ServiceHandler<PerfTestService> {
  public:
-  void test(
+  void native_test(
       PerfTestResponse& response,
       std::unique_ptr<Request> req) override;
 

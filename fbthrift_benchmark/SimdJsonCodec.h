@@ -58,10 +58,17 @@ inline void writeRequest(Fmt& f, const Request& req) {
     });
 
     writeKeyValue(f, first, "2", "str", [&]() {
-        if (req.payload().has_value()) {
-            auto b64 = apache::thrift::protocol::base64Encode(folly::ByteRange(
-                reinterpret_cast<const uint8_t*>(req.payload()->data()),
-                req.payload()->size()));
+        if (req.payload().has_value() && *req.payload()) {
+            auto& buf = *req.payload();
+            std::string b64;
+            if (buf->isChained()) {
+                auto coalesced = buf->cloneCoalesced();
+                b64 = apache::thrift::protocol::base64Encode(
+                    folly::ByteRange(coalesced->data(), coalesced->length()));
+            } else {
+                b64 = apache::thrift::protocol::base64Encode(
+                    folly::ByteRange(buf->data(), buf->length()));
+            }
             while (!b64.empty() && b64.back() == '=') b64.pop_back();
             f.string(b64);
         } else f.string("");
@@ -83,10 +90,16 @@ inline void writeResponse(Fmt& f, const PerfTestResponse& resp) {
     });
 
     writeKeyValue(f, first, "2", "str", [&]() {
-        if (resp.payload().has_value()) {
-            f.string(apache::thrift::protocol::base64Encode(folly::ByteRange(
-                reinterpret_cast<const uint8_t*>(resp.payload()->data()),
-                resp.payload()->size())));
+        if (resp.payload().has_value() && *resp.payload()) {
+            auto& buf = *resp.payload();
+            if (buf->isChained()) {
+                auto coalesced = buf->cloneCoalesced();
+                f.string(apache::thrift::protocol::base64Encode(
+                    folly::ByteRange(coalesced->data(), coalesced->length())));
+            } else {
+                f.string(apache::thrift::protocol::base64Encode(
+                    folly::ByteRange(buf->data(), buf->length())));
+            }
         } else f.string("");
     });
 
@@ -127,9 +140,9 @@ struct SimdJsonCodec {
             if (std::string(kv.key) == "1")
                 req.echo_attachment() = (int64_t(tp.value) != 0);
             else if (std::string(kv.key) == "2") {
-                auto b64 = std::string(std::string_view(tp.value));
-                auto decoded = apache::thrift::protocol::base64Decode(b64);
-                req.payload() = decoded->moveToFbString().toStdString();
+                auto sv = std::string_view(tp.value);
+                req.payload() = apache::thrift::protocol::base64Decode(
+                    folly::StringPiece(sv.data(), sv.size()));
             }
         }
         return req;
@@ -151,9 +164,9 @@ struct SimdJsonCodec {
             else if (std::string(kv.key) == "1")
                 resp.mem_usage() = double(tp.value);
             else if (std::string(kv.key) == "2") {
-                auto b64 = std::string(std::string_view(tp.value));
-                auto decoded = apache::thrift::protocol::base64Decode(b64);
-                resp.payload() = decoded->moveToFbString().toStdString();
+                auto sv = std::string_view(tp.value);
+                resp.payload() = apache::thrift::protocol::base64Decode(
+                    folly::StringPiece(sv.data(), sv.size()));
             }
         }
         return resp;

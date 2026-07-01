@@ -5,11 +5,12 @@
 - `--mode native` — Thrift Binary 原生协议
 - `--mode simdjson` — simdjson 高性能 JSON (mini_formatter + DOM parser)
 - `--mode sonicjson` — 字节跳动 sonic-cpp JSON (Document DOM + WriteBuffer)
+- `--mode universal` — 通用模式，支持 protobuf 序列化
 
 ## 环境依赖
 
 - C++17, GCC 10+
-- fbthrift, folly, fizz, wangle, fmt, glog, gflags
+- fbthrift, folly, fizz, wangle, fmt, glog, gflags, protobuf
 - simdjson (ARM NEON / x86 AVX)
 - sonic-cpp (ARM NEON / x86 AVX, header-only)
 
@@ -21,15 +22,10 @@ third/
 ├── fizz/lib/cmake/fizz
 ├── wangle/lib/cmake/wangle
 ├── fbthrift/lib/cmake/fbthrift
+├── protobuf/lib64/cmake/protobuf
 ├── fmt/lib/cmake/fmt
 ├── simdjson/{include/simdjson.h, lib64/libsimdjson.a}
 └── sonic-cpp/include/sonic/
-```
-
-## 代码生成
-
-```bash
-thrift1 --gen mstch_cpp2 press.thrift
 ```
 
 ## 编译

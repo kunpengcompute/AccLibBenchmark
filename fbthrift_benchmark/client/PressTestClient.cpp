@@ -13,6 +13,7 @@
 #include <gflags/gflags.h>
 #include <folly/SocketAddress.h>
 #include <folly/init/Init.h>
+#include <folly/io/IOBuf.h>
 #include <folly/io/async/EventBase.h>
 #include <folly/executors/CPUThreadPoolExecutor.h>
 #include <folly/executors/IOThreadPoolExecutor.h>
@@ -26,8 +27,10 @@
 #include "gen-cpp2/UniversalService.h"
 #include "SimdJsonCodec.h"
 #include "SonicJsonCodec.h"
+#include "gen-cpp2/press.pb.h"
 #include "util/LatencyStats.h"
 #include "util/ResourceMonitor.h"
+#include "IOBufZeroCopyStream.h"
 
 DEFINE_string(host, "127.0.0.1", "Server host");
 DEFINE_int32(port, 8002, "Server port");
@@ -228,28 +231,80 @@ static SimdJsonStats g_sonicjson_stats;
 // ============ Serialization Handler (for universal mode) ============
 struct SerializationHandler {
   virtual ~SerializationHandler() = default;
-  virtual std::string serialize(const std::string& payload, bool echo_attachment) = 0;
-  virtual void processResponse(const std::string& payload, ThreadStats& stats) = 0;
+  virtual std::unique_ptr<folly::IOBuf> serialize(const std::string& payload, bool echo_attachment) = 0;
+  virtual void processResponse(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) = 0;
   virtual universal::SerializationType getType() const = 0;
 };
 
-
-struct UniversalSimdJsonHandler : SerializationHandler {
-  std::string serialize(const std::string& payload, bool echo_attachment) override {
-    press_test::Request req;
-    req.echo_attachment() = echo_attachment;
-    req.payload() = payload;
-    return press_test::SimdJsonCodec::serialize(req);
+struct ProtobufHandler : SerializationHandler {
+  std::unique_ptr<folly::IOBuf> serialize(const std::string& payload, bool echo_attachment) override {
+    press_test_proto::Request req;
+    req.set_echo_attachment(echo_attachment);
+    req.set_payload(payload);
+    size_t size_hint = req.ByteSizeLong();
+    folly::IOBufQueue queue;
+    press_test::IOBufAsZeroCopyOutputStream stream(&queue, size_hint);
+    req.SerializeToZeroCopyStream(&stream);
+    return queue.move();
   }
 
-  void processResponse(const std::string& payload, ThreadStats& stats) override {
-    auto resp = press_test::SimdJsonCodec::deserializeResponse(payload);
+  void processResponse(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) override {
+    press_test_proto::PerfTestResponse resp;
+    const auto deser_start = std::chrono::steady_clock::now();
+    if (payload) {
+      press_test::IOBufAsZeroCopyInputStream stream(payload.get());
+      if (resp.ParseFromZeroCopyStream(&stream)) {
+        stats.universal_deserialize.addValue(std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::steady_clock::now() - deser_start).count());
+        try {
+          double cpu_val = std::stod(resp.cpu_usage());
+          if (cpu_val > 0) {
+            stats.server_cpu_usage.addValue(cpu_val);
+          }
+          double mem_val = std::stod(resp.mem_usage());
+          if (mem_val > 0) {
+            stats.server_mem_usage.addValue(mem_val);
+          }
+        } catch (...) {}
+        g_total_bytes.fetch_add(resp.payload().size(), std::memory_order_relaxed);
+      }
+    }
+  }
+
+  universal::SerializationType getType() const override {
+    return universal::SerializationType::PROTOBUF;
+  }
+};
+
+struct UniversalSimdJsonHandler : SerializationHandler {
+  std::unique_ptr<folly::IOBuf> serialize(const std::string& payload, bool echo_attachment) override {
+    press_test::Request req;
+    req.echo_attachment() = echo_attachment;
+    req.payload() = folly::IOBuf::copyBuffer(payload);
+    std::string json = press_test::SimdJsonCodec::serialize(req);
+    return folly::IOBuf::copyBuffer(json);
+  }
+
+  void processResponse(const std::unique_ptr<folly::IOBuf>& payload, ThreadStats& stats) override {
+    if (!payload) return;
+    std::string json_str;
+    std::string_view json;
+    if (!payload->isChained()) {
+      json = std::string_view(reinterpret_cast<const char*>(payload->data()), payload->length());
+    } else {
+      folly::io::Cursor cursor(payload.get());
+      json_str = cursor.readFixedString(payload->computeChainDataLength());
+      json = json_str;
+    }
+    auto resp = press_test::SimdJsonCodec::deserializeResponse(json);
     if (resp.cpu_usage().has_value() && *resp.cpu_usage() > 0)
       stats.server_cpu_usage.addValue(*resp.cpu_usage());
     if (resp.mem_usage().has_value() && *resp.mem_usage() > 0)
       stats.server_mem_usage.addValue(*resp.mem_usage());
-    g_total_bytes.fetch_add(resp.payload().has_value() ? resp.payload()->size() : 0,
-                            std::memory_order_relaxed);
+    if (resp.payload().has_value() && *resp.payload()) {
+      g_total_bytes.fetch_add((*resp.payload())->computeChainDataLength(),
+                              std::memory_order_relaxed);
+    }
   }
 
   universal::SerializationType getType() const override {
@@ -258,8 +313,9 @@ struct UniversalSimdJsonHandler : SerializationHandler {
 };
 
 std::unique_ptr<SerializationHandler> createSerializationHandler(const std::string& type) {
-  
-  if (type == "simdjson") {
+  if (type == "protobuf") {
+    return std::make_unique<ProtobufHandler>();
+  } else if (type == "simdjson") {
     return std::make_unique<UniversalSimdJsonHandler>();
   }
   LOG(FATAL) << "Unknown universal serialization: " << type;
@@ -335,7 +391,7 @@ std::shared_ptr<BenchmarkState> run_benchmark(
   // Pre-encode for simdjson mode
   if (is_simdjson_mode || is_sonicjson_mode) {
     state->request.echo_attachment() = FLAGS_echo_attachment;
-    state->request.payload() = payload;
+    state->request.payload() = folly::IOBuf::copyBuffer(payload);
     state->simdjson_encoded = press_test::SimdJsonCodec::serialize(state->request);
     LOG(INFO) << (is_simdjson_mode ? "SimdJSON" : "SonicJSON")
               << " mode: pre-encoded payload, json_size="
@@ -357,7 +413,7 @@ std::shared_ptr<BenchmarkState> run_benchmark(
   }
 
   state->request.echo_attachment() = FLAGS_echo_attachment;
-  state->request.payload() = payload;
+  state->request.payload() = folly::IOBuf::copyBuffer(payload);
   state->start_time = monotonic_us();
 
   // ========================================================================
@@ -441,6 +497,7 @@ std::shared_ptr<BenchmarkState> run_benchmark(
       g_simdjson_stats.encode_ns.fetch_add(encode_ns, std::memory_order_relaxed);
       g_simdjson_stats.encode_count.fetch_add(1, std::memory_order_relaxed);
 
+
       int64_t send_time = monotonic_us();
       std::get<std::unique_ptr<PerfTestClient>>(ctx.client)->semifuture_simdjson_call(json)
           .via(cpu_executor)
@@ -499,10 +556,10 @@ std::shared_ptr<BenchmarkState> run_benchmark(
               LOG(ERROR) << "SonicJSON RPC failed: " << t.exception().what();
             }
           });
-    } else if (state->is_simdjson_mode || state->is_native_mode) {
+    } else if (state->is_native_mode) {
       // === Native mode: native_test() RPC ===
       int64_t send_time = monotonic_us();
-      std::get<std::unique_ptr<PerfTestClient>>(ctx.client)->semifuture_test(state->request)
+      std::get<std::unique_ptr<PerfTestClient>>(ctx.client)->semifuture_native_test(state->request)
           .via(cpu_executor)
           .thenTry([state, idx, send_time, on_response](folly::Try<press_test::PerfTestResponse>&& t) {
             int64_t recv_time = monotonic_us();
@@ -515,7 +572,10 @@ std::shared_ptr<BenchmarkState> run_benchmark(
               if (t.value().mem_usage().value() > 0) {
                 g_stats_per_cpu[get_stats_idx()]->server_mem_usage.addValue(t.value().mem_usage().value());
               }
-              g_total_bytes.fetch_add(state->request.payload()->size(), std::memory_order_relaxed);
+              auto& resp_payload = *t.value().payload();
+              if (resp_payload) {
+                g_total_bytes.fetch_add(resp_payload->computeChainDataLength(), std::memory_order_relaxed);
+              }
             } else {
               LOG(ERROR) << "RPC failed: " << t.exception().what();
             }
@@ -523,8 +583,19 @@ std::shared_ptr<BenchmarkState> run_benchmark(
     } else {
       // === Universal mode: universal_test() RPC ===
       int64_t serialize_start = monotonic_us();
-      std::string serialized = state->serialization_handler->serialize(
-          *state->request.payload(), *state->request.echo_attachment());
+      std::string payload_input;
+      auto& req_payload = *state->request.payload();
+      if (req_payload) {
+        if (!req_payload->isChained()) {
+          payload_input.assign(reinterpret_cast<const char*>(req_payload->data()),
+                               req_payload->length());
+        } else {
+          folly::io::Cursor cursor(req_payload.get());
+          payload_input = cursor.readFixedString(req_payload->computeChainDataLength());
+        }
+      }
+      std::unique_ptr<folly::IOBuf> serialized = state->serialization_handler->serialize(
+          payload_input, *state->request.echo_attachment());
       int64_t univ_serialize_us = monotonic_us() - serialize_start;
       g_stats_per_cpu[get_stats_idx()]->universal_serialize.addValue(univ_serialize_us);
 
