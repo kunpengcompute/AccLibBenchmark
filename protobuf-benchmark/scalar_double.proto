@@ -1,0 +1,6 @@
+syntax = "proto3";
+package pb.test;
+
+message ScalarDouble {
+    repeated double numbers = 1 [packed=false];
+}

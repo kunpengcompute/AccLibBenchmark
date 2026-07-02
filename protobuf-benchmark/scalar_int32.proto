@@ -1,0 +1,6 @@
+syntax = "proto3";
+package pb.test;
+
+message ScalarInt32 {
+    repeated int32 numbers = 1 [packed=false];
+}

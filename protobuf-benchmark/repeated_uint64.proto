@@ -1,0 +1,6 @@
+syntax = "proto3";
+package pb.test;
+
+message RepeatedUInt64 {
+    repeated uint64 numbers = 1 [packed=true];
+}

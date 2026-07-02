@@ -1,0 +1,6 @@
+syntax = "proto3";
+package pb.test;
+
+message RepeatedSInt32 {
+    repeated sint32 numbers = 1 [packed=true];
+}

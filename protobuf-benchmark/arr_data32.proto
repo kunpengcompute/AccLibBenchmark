@@ -1,6 +1,0 @@
-syntax = "proto3";
-package pb.test;
-
-message ArrData32 {
-    repeated uint32 numbers = 1 [packed=true];
-}

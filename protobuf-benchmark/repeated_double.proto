@@ -1,0 +1,6 @@
+syntax = "proto3";
+package pb.test;
+
+message RepeatedDouble {
+    repeated double numbers = 1 [packed=true];
+}

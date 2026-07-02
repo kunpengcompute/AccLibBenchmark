@@ -1,0 +1,6 @@
+syntax = "proto3";
+package pb.test;
+
+message ScalarBool {
+    repeated bool values = 1 [packed=false];
+}
