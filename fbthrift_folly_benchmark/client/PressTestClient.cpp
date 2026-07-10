@@ -238,6 +238,10 @@ void fillTestFields(press_test::Request& req) {
         if (rnd) { std::map<std::string,int64_t> m; for (int i=0;i<FLAGS_kv_map_size;++i) m[randomStr(std::uniform_int_distribution<size_t>(4,16)(rng_))]=std::uniform_int_distribution<int64_t>()(rng_); req.kv_map() = m; }
         else req.kv_map() = {{"key1",100},{"key2",200}};
     }
+    if (on("i64_list")) {
+        if (rnd) { std::vector<int64_t> v(FLAGS_int_list_size); for (auto& x:v) x=randI64ByBytes(std::uniform_int_distribution<int>(1, 10)(rng_)); req.i64_list() = v; }
+        else req.i64_list() = {100, 200, 300};
+    }
 }
 
 // Adjust payload to keep total serialized size close to target

@@ -11,6 +11,7 @@ struct Request {
     8: list<string> str_list;
     9: set<string> str_set;
     10: map<string, i64> kv_map;
+    11: list<i64> i64_list;
 }
 
 struct PerfTestResponse {
