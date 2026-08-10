@@ -72,6 +72,12 @@ ServerHolder newServer(int32_t port, int32_t num_io_threads, int32_t num_cpu_thr
 int main(int argc, char** argv) {
   FLAGS_logtostderr = 1;
   folly::init(&argc, &argv);
+  
+  if (!getenv("DISABLE_IOBUF_POOL")) {
+    folly::IOBuf::setBlockSize(256 * 1024);
+    folly::IOBuf::setMaxBlocksPerThread(64);
+    folly::IOBuf::enableMemoryPool();
+  }
 
   util::init_resource_collector();
 

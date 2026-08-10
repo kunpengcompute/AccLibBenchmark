@@ -153,7 +153,7 @@ std::unique_ptr<PerfTestClient> newPerfTestClient(
       channel->setDesiredCompressionConfig(*config);
     return std::make_unique<PerfTestClient>(std::move(channel));
   } else if (transport == "header") {
-    auto channel = apache::thrift::HeaderClientChannel::newChannel(std::move(socket));
+    auto channel = apache::thrift::HeaderClientChannel::newChannel(std::move(tsock));
     if (FLAGS_rpc_timeout_ms > 0) channel->setTimeout(FLAGS_rpc_timeout_ms);
     if (auto config = getCompressionConfig(FLAGS_compression))
       channel->setDesiredCompressionConfig(*config);
@@ -690,6 +690,13 @@ void test_once(int payload_size) {
 int main(int argc, char* argv[]) {
   FLAGS_logtostderr = true;
   const folly::Init init(&argc, &argv);
+
+  if (!getenv("DISABLE_IOBUF_POOL")) {
+    folly::IOBuf::setBlockSize(256 * 1024);
+    folly::IOBuf::setMaxBlocksPerThread(64);
+    folly::IOBuf::enableMemoryPool();
+  }
+  
   util::init_resource_collector();
 
   if (FLAGS_payload_size >= 0) {
