@@ -153,7 +153,7 @@ std::unique_ptr<PerfTestClient> newPerfTestClient(
       channel->setDesiredCompressionConfig(*config);
     return std::make_unique<PerfTestClient>(std::move(channel));
   } else if (transport == "header") {
-    auto channel = apache::thrift::HeaderClientChannel::newChannel(std::move(socket));
+    auto channel = apache::thrift::HeaderClientChannel::newChannel(std::move(tsock));
     if (FLAGS_rpc_timeout_ms > 0) channel->setTimeout(FLAGS_rpc_timeout_ms);
     if (auto config = getCompressionConfig(FLAGS_compression))
       channel->setDesiredCompressionConfig(*config);
@@ -237,6 +237,10 @@ void fillTestFields(press_test::Request& req) {
     if (on("kv_map")) {
         if (rnd) { std::map<std::string,int64_t> m; for (int i=0;i<FLAGS_kv_map_size;++i) m[randomStr(std::uniform_int_distribution<size_t>(4,16)(rng_))]=std::uniform_int_distribution<int64_t>()(rng_); req.kv_map() = m; }
         else req.kv_map() = {{"key1",100},{"key2",200}};
+    }
+    if (on("i64_list")) {
+        if (rnd) { std::vector<int64_t> v(FLAGS_int_list_size); for (auto& x:v) x=randI64ByBytes(std::uniform_int_distribution<int>(1, 10)(rng_)); req.i64_list() = v; }
+        else req.i64_list() = {100, 200, 300};
     }
 }
 
@@ -686,6 +690,13 @@ void test_once(int payload_size) {
 int main(int argc, char* argv[]) {
   FLAGS_logtostderr = true;
   const folly::Init init(&argc, &argv);
+
+  if (!getenv("DISABLE_IOBUF_POOL")) {
+    folly::IOBuf::setBlockSize(256 * 1024);
+    folly::IOBuf::setMaxBlocksPerThread(64);
+    folly::IOBuf::enableMemoryPool();
+  }
+  
   util::init_resource_collector();
 
   if (FLAGS_payload_size >= 0) {
