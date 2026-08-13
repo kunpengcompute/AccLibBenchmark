@@ -17,16 +17,17 @@
 namespace cpp2 press_test
 
 struct Request {
-    1: bool   echo_attachment;
+    1: bool echo_attachment;
     2: binary payload;
-    3: i32    int_val;
-    4: i64    long_val;
+    3: i32 int_val;
+    4: i64 long_val;
     5: double double_val;
     6: string str_val;
-    7: list<i32>  int_list;
+    7: list<i32> int_list;
     8: list<string> str_list;
     9: set<string> str_set;
     10: map<string, i64> kv_map;
+    11: list<i64> i64_list;
 }
 
 struct PerfTestResponse {
@@ -132,13 +133,13 @@ make -j
 # 只测 binary payload（纯 echo）
 ./press_client ... --fields=none
 
-# 指定组合
+# 自定义指定组合
 ./press_client ... --fields=int_val,str_val
 ./press_client ... --fields=int_list,str_list,str_set,kv_map
 ./press_client ... --fields=double_val,long_val,kv_map
 ```
 
-可选值：`int_val`, `long_val`, `double_val`, `str_val`, `int_list`, `str_list`, `str_set`, `kv_map`, `all`, `none`
+可选值：`int_val`, `long_val`, `double_val`, `str_val`, `int_list`,`i64_list`, `str_list`, `str_set`, `kv_map`, `all`, `none`
 
 ### `--random_fields` 用法
 
