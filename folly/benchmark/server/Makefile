@@ -1,14 +1,14 @@
 # 定义 fmt 的根目录
-FMT_HOME := /home/g00570279/folly/build/installed/fmt
+FMT_HOME := /home/xxx/folly/build/installed/fmt
 
 # 在原有的 INC 后面加上 fmt 的 include 目录
-INC      := -I/home/g00570279/ins/folly_POC/include -I$(FMT_HOME)/include
+INC      := -I/home/xxx/ins/folly_POC/include -I$(FMT_HOME)/include
 
 # LIBS 保持不变 (注意你之前已经加上了 -lfmt)
 LIBS     := -lpthread -lfolly -lfmt -levent -luring -lglog -lgflags -ldouble-conversion -lz -ldl -liberty -DENABLE_VLOG=1  -DGOOGLE_GLOG_DLL_DECL= -O3
 
 # 在 LDFLAGS 中添加 folly 和 fmt 的 -L 路径和 -rpath 运行时路径
-LDFLAGS  := -L/home/g00570279/ins/folly_POC/lib -Wl,-rpath,/home/g00570279/ins/folly_POC/lib \
+LDFLAGS  := -L/home/xxx/ins/folly_POC/lib -Wl,-rpath,/home/xxx/ins/folly_POC/lib \
             -L$(FMT_HOME)/lib -Wl,-rpath,$(FMT_HOME)/lib
 
 CPPCLAGS := -std=c++17 -O3
