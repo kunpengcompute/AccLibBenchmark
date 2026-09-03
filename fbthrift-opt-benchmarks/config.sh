@@ -1,3 +1,3 @@
 # export FBTHRIFT_HOME=/path/to/fbthrift
-#export FBTHRIFT_HOME=/home/g00570279/ins/fbthrift_gitcode
-export FBTHRIFT_HOME=/home/g00570279/ins/fbthrift_ori
+#export FBTHRIFT_HOME=/home/xxx/ins/fbthrift_gitcode
+export FBTHRIFT_HOME=/home/xxx/ins/fbthrift_ori

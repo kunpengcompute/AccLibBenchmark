@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # --- 1. 基础配置 ---
-INSTALL_DIR="/home/w00663106"
+INSTALL_DIR="/home/xxx"
 MY_OPENSSL="$INSTALL_DIR/bin/openssl"
 SRC_DIR="openssl-3.0.17"
 
@@ -68,8 +68,8 @@ if [ ! -f "$MY_OPENSSL" ]; then
     
     make -j$(nproc) && make install
     cd ..
-    export LD_LIBRARY_PATH="/home/w00663106/lib64:/home/w00663106/lib:$LD_LIBRARY_PATH"
-    /home/w00663106/bin/openssl version -a
+    export LD_LIBRARY_PATH="/home/xxx/lib64:/home/xxx/lib:$LD_LIBRARY_PATH"
+    /home/xxx/bin/openssl version -a
     echo "编译完成。"
 fi
 

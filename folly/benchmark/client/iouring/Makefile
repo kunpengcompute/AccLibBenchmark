@@ -1,6 +1,6 @@
-FOLLY_HOME := /home/g00570279/ins/folly_POC
+FOLLY_HOME := /home/xxx/ins/folly_POC
 
-FMT_HOME   := /home/g00570279/folly/build/installed/fmt
+FMT_HOME   := /home/xxx/folly/build/installed/fmt
 
 # 加上 fmt 的头文件路径（以防后续需要）
 INC      := -I$(FOLLY_HOME)/include -I$(FMT_HOME)/include

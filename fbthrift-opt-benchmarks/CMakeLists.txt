@@ -15,15 +15,15 @@ endif()
 
 
 list(APPEND CMAKE_PREFIX_PATH
-  "/home/g00570279/ins/folly/lib/cmake/folly"
-  "/home/g00570279/folly/build/installed/fmt/lib/cmake/fmt"
+  "/home/xxx/ins/folly/lib/cmake/folly"
+  "/home/xxx/folly/build/installed/fmt/lib/cmake/fmt"
         "${FBTHRIFT_HOME}"
-  "/home/g00570279/ins"
+  "/home/xxx/ins"
 )
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 # Find dependencies in an order compatible with FBThrift imported targets.
-set(FOLLY_ROOT "/home/g00570279/ins/folly")
+set(FOLLY_ROOT "/home/xxx/ins/folly")
 find_package(folly REQUIRED)
 find_package(fmt REQUIRED)
 find_package(wangle REQUIRED)
