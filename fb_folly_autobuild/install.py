@@ -17,7 +17,7 @@ from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 
-WORK = Path("/home/a00970558/temp_")
+WORK = Path("/home/xxx/temp_")
 INS = WORK / "ins"
 
 # Re-entry behavior. Existing Git checkouts are reused by default so that local
