@@ -6,13 +6,13 @@ import re
 import subprocess
 import time
 
-# Server sample: numactl -N 0 /home/a00970558/temp_/fbthrift_folly_benchmark/build/press_server --port 23456 --use_io_uring=true --num_cpu_threads=48 --num_io_threads=48
+# Server sample: numactl -N 0 /home/xxx/temp_/fbthrift_folly_benchmark/build/press_server --port 23456 --use_io_uring=true --num_cpu_threads=48 --num_io_threads=48
 
 
 # ==================== 1. Configuration Setup ====================
 
 OUTPUT_CSV = "benchmark_results.csv"
-EXECUTABLE = "/home/a00970558/newtemp_/fbthrift_folly_benchmark/build/press_client"
+EXECUTABLE = "/home/xxx/newtemp_/fbthrift_folly_benchmark/build/press_client"
 DRY_RUN = False
 
 # Skip prefix runs.
